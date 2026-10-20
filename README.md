@@ -30,6 +30,18 @@ All objects install into the `indexing` schema in a `DBA_Utilities` database. On
 | **sp_IndexOptimizationSuite** | Runs all optimization tools in the correct order with one call. Combined output mode organizes findings by database and table. Linked server support for running from a central ops server. |
 | **sp_IndexingSuiteSummary** | Fleet-wide reporting across all tools with optional row-level detail. |
 
+## Download
+
+| Script | Description |
+|--------|-------------|
+| [INSTALL_IndexOptimizationSuite.sql](https://github.com/mja1175/SQL-Server-Optimization/tree/main/tools/INSTALL_IndexOptimizationSuite.sql) | Core suite — all 6 optimization tools + orchestrator + summary |
+| [index-maintenance.sql](https://github.com/mja1175/SQL-Server-Optimization/tree/main/tools/index-maintenance.sql) | Index defragmentation (REORG/REBUILD) |
+| [statistics-maintenance.sql](https://github.com/mja1175/SQL-Server-Optimization/tree/main/tools/statistics-maintenance.sql) | Stale statistics detection and update |
+| [query-plan-analysis.sql](https://github.com/mja1175/SQL-Server-Optimization/tree/main/tools/query-plan-analysis.sql) | One-off query plan diagnostics |
+| [help-index-usage.sql](https://github.com/mja1175/SQL-Server-Optimization/tree/main/tools/help-index-usage.sql) | Enhanced sp_helpindex with usage stats |
+
+Or clone the full repo: `git clone https://github.com/mja1175/SQL-Server-Optimization.git`
+
 ## Installation
 
 **Prerequisites:** SQL Server 2016+, a `DBA_Utilities` database on each server.

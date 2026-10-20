@@ -1,67 +1,126 @@
-# Indexing
+# SQL Server Optimization Suite
 
-SQL Server index management suite. Two pillars: **optimization** (finding and fixing index problems) and **maintenance** (keeping indexes and statistics healthy).
+A comprehensive SQL Server index optimization and maintenance toolkit. Eight tools that find what's missing, remove what's redundant, diagnose what's slow, and keep your indexes and statistics healthy — plus an orchestrator that runs them all with one call.
 
-All objects live in `DBA_Utilities` — optimization tools in the `indexing` schema, maintenance tools in `indexing` and `dbo` schemas.
+All objects install into the `indexing` schema in a `DBA_Utilities` database. One script, one schema, every server.
 
-## Structure
+## What's Included
 
+### Optimization Tools
+| Tool | What It Does |
+|------|-------------|
+| **Duplicate Index Detection** | Finds duplicate, redundant, and combinable indexes. Generates DROP and COMBINE scripts with size estimation. |
+| **Key Lookup Elimination** | Scans the plan cache for key lookups and recommends INCLUDE columns to eliminate double I/O. |
+| **Unused Index Detection** | Identifies indexes with zero reads and active write overhead. DISABLE (reversible) or DROP with confidence levels. |
+| **Missing Index Recommendations** | Multi-stage consolidation pipeline that reduces hundreds of raw DMV suggestions into actionable, non-overlapping recommendations. |
+| **Expensive Query Analysis** | Finds the most expensive queries in the plan cache — table scans, missing index hints, and regressed queries. |
+| **Column Access Patterns** | Discovers which columns are most frequently filtered, joined, and sorted on for composite index opportunities. |
+| **Query Plan Analysis** | One-off diagnostic: pass a slow query, get back stale statistics, missing indexes, implicit conversions, and cardinality issues with ready-to-run fix scripts. |
+| **sp_helpindexUsage** | Enhanced sp_helpindex with usage stats, column-level detail, and index sizes in one result set. |
+
+### Maintenance Tools
+| Tool | What It Does |
+|------|-------------|
+| **Index Maintenance** | Automated defragmentation with edition-aware REORG/REBUILD. ONLINE rebuilds on Enterprise with automatic OFFLINE fallback. Time limits, history logging, and smart thresholds. |
+| **Statistics Maintenance** | Stale statistics detection and targeted updates based on modification rates and table size. Replaces blanket UPDATE STATISTICS with surgical precision. |
+
+### Orchestration
+| Component | What It Does |
+|-----------|-------------|
+| **sp_IndexOptimizationSuite** | Runs all optimization tools in the correct order with one call. Combined output mode organizes findings by database and table. Linked server support for running from a central ops server. |
+| **sp_IndexingSuiteSummary** | Fleet-wide reporting across all tools with optional row-level detail. |
+
+## Installation
+
+**Prerequisites:** SQL Server 2016+, a `DBA_Utilities` database on each server.
+
+### Core Suite (required)
+```sql
+-- Installs all 6 optimization tools + orchestrator + summary
+USE DBA_Utilities;
+GO
+-- Execute INSTALL_IndexOptimizationSuite.sql
 ```
-indexing/
-├── optimization/
-│   ├── build/                              # Build script for combined install
-│   │   └── build_install_script.py
-│   ├── install/                            # Auto-generated install script
-│   │   └── INSTALL_IndexOptimizationSuite.sql
-│   ├── documentation/                      # CLAUDE.md, README.md, wiki/
-│   ├── suite/                              # Orchestrator + summary + shared utility
-│   │   ├── suite.sql
-│   │   ├── suite.md
-│   │   └── run-scripts.sql
-│   └── tools/                              # One .sql + one .md per tool
-│       ├── duplicate-index/
-│       ├── key-lookup-elimination/
-│       ├── unused-index-detection/
-│       ├── optimize-index/
-│       ├── expensive-query-plan-analysis/
-│       ├── column-access-pattern-analysis/
-│       ├── query-plan-analysis/
-│       └── help-index-usage/
-│
-├── maintenance/
-│   ├── index/                              # Index defragmentation (REORG/REBUILD)
-│   │   ├── index-maintenance.sql
-│   │   └── index-maintenance.md
-│   ├── statistics/                         # Stale statistics detection and update
-│   │   ├── statistics-maintenance.sql
-│   │   └── statistics-maintenance.md
-│   └── wiki/
-│
-└── summaries/                              # Historical HTML summary reports
+
+### Maintenance Tools (recommended)
+```sql
+-- Index defragmentation (REORG/REBUILD with edition-aware defaults)
+USE DBA_Utilities;
+GO
+-- Execute tools/index-maintenance.sql
+
+-- Statistics maintenance (stale stats detection and targeted updates)
+USE DBA_Utilities;
+GO
+-- Execute tools/statistics-maintenance.sql
 ```
+
+### Standalone Diagnostics (optional)
+```sql
+-- Query plan analysis (one-off slow query diagnostics)
+USE DBA_Utilities;
+GO
+-- Execute tools/query-plan-analysis.sql
+
+-- sp_helpindexUsage (installs in master, not DBA_Utilities)
+USE master;
+GO
+-- Execute tools/help-index-usage.sql
+```
+
+All scripts are safe to re-run. Tables use `IF NOT EXISTS` (data preserved). Procedures use `CREATE OR ALTER` (always updated).
 
 ## Quick Start
 
 ```sql
--- Run the full optimization suite
-EXEC indexing.sp_IndexOptimizationSuite @DatabaseName = 'mc_%', @RunnableUnder = '1,5e';
+-- Run the full suite
+EXEC indexing.sp_IndexOptimizationSuite
+    @DatabaseName = 'MyApp_%'         -- NULL = all databases. Supports CSV and LIKE wildcards.
+    ,@RunnableUnder = '1,5e'          -- NULL = all uncommented. '1,5e' = 1GB Standard / 5GB Enterprise.
+    ,@CombinedOutput = 1;             -- One script organized by database -> table -> tool.
 
--- Combined output with linked server support
-EXEC indexing.sp_IndexOptimizationSuite @DatabaseName = 'mc_%', @RunnableUnder = '1,5e',
-    @CombinedOutput = 1, @LinkedServer = 1;
+-- Fleet-wide summary
+EXEC indexing.sp_IndexingSuiteSummary @Days = 7;
+
+-- Diagnose a specific slow query
+EXEC indexing.sp_AnalyzeQueryPlan
+    @SQL = 'SELECT ... FROM ... WHERE ...',
+    @DatabaseName = 'MyDatabase';
 
 -- Index maintenance (dry run, then execute)
-EXEC indexing.sp_IndexMaintenance;
-EXEC indexing.sp_IndexMaintenance @Execute = 1;
+EXEC indexing.sp_IndexMaintenance @Execute = 0;  -- Preview
+EXEC indexing.sp_IndexMaintenance @Execute = 1;  -- Execute
 
 -- Statistics maintenance
 EXEC dbo.sp_StatisticsMaintenance @Run = 1, @StatisticsSample = 100;
-
--- Diagnose a specific slow query
-EXEC indexing.sp_AnalyzeQueryPlan @SQL = 'SELECT ...', @DatabaseName = 'mc_myclient_1234';
-
--- Fleet-wide summary of all optimization activity
-EXEC indexing.sp_IndexingSuiteSummary @Days = 7, @Detail = 1;
 ```
 
-See `optimization/suite/run-scripts.sql` for the full parameter reference.
+## Key Features
+
+### Edition-Aware
+Automatically detects Enterprise vs Standard edition. Enterprise gets `WITH (ONLINE = ON)` for index operations and more aggressive rebuild thresholds (since online rebuilds don't block queries).
+
+### @RunnableUnder — Smart Threshold Commenting
+Control which index operations are auto-executable vs. commented out for manual review:
+- `NULL` — everything uncommented (all executable)
+- `'2'` — indexes estimated >= 2 GB are commented out
+- `'1,5e'` — 1 GB threshold for Standard, 5 GB for Enterprise (separate thresholds because Enterprise can rebuild online)
+
+### Linked Server Support
+Run the suite from a central ops server. Pass `@LinkedServer = 1` and the output script wraps each statement in `EXEC(...) AT [server]` syntax — ready to execute from your ops window without connecting to each server individually.
+
+### Size Estimation
+Index size estimates use actual data sampling (`AVG(DATALENGTH())` on 10,000 rows) instead of `max_length` guesses. Estimates are always >= current index size because adding columns can never shrink an index.
+
+### ResolvedDate Tracking
+Every recommendation includes an `UPDATE ... SET ResolvedDate = GETDATE()` statement. When you execute the fix, the recommendation is marked resolved. Re-running the suite only shows unresolved findings — no duplicates, clear progress tracking.
+
+## Documentation
+
+Full documentation is available at [optimizesqlserver.com](https://optimizesqlserver.com).
+
+## License
+
+MIT License — see [LICENSE](LICENSE).
+
+© 2026 Mike Armstrong

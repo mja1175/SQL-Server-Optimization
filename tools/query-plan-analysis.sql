@@ -1,7 +1,14 @@
+/*
+    SQL Server Optimization Suite
+    Default Database: DBA_Utilities
+
+    To install in a different database, find and replace all instances of
+    "DBA_Utilities" with your database name before running this script.
+*/
 USE DBA_Utilities;
 GO
 
-CREATE OR ALTER PROCEDURE indexing.sp_AnalyzeQueryPlan
+CREATE OR ALTER PROCEDURE optimize.sp_AnalyzeQueryPlan
     @SQL          NVARCHAR(MAX)  = NULL,  -- query to analyze (executes it, grabs plan from cache)
     @PlanXML      XML            = NULL,  -- OR pass in a plan directly (from .sqlplan file or SSMS)
     @DatabaseName NVARCHAR(128)  = NULL,  -- database context for @SQL (NULL = current)

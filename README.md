@@ -86,28 +86,38 @@ All scripts are safe to re-run. Tables use `IF NOT EXISTS` (data preserved). Pro
 
 ```sql
 -- Run the full suite
-EXEC indexing.sp_IndexOptimizationSuite
-    @DatabaseName = 'MyApp_%'         -- NULL = all databases. Supports CSV and LIKE wildcards.
+EXEC optimize.sp_IndexOptimizationSuite
+    @Databases = 'USER_DATABASES'     -- Ola-style: USER_DATABASES, ALL_DATABASES, %pattern%, -exclusions
     ,@RunnableUnder = '1,5e'          -- NULL = all uncommented. '1,5e' = 1GB Standard / 5GB Enterprise.
     ,@CombinedOutput = 1;             -- One script organized by database -> table -> tool.
 
 -- Fleet-wide summary
-EXEC indexing.sp_IndexingSuiteSummary @Days = 7;
+EXEC optimize.sp_IndexingSuiteSummary @Days = 7;
 
 -- Diagnose a specific slow query
-EXEC indexing.sp_AnalyzeQueryPlan
+EXEC optimize.sp_AnalyzeQueryPlan
     @SQL = 'SELECT ... FROM ... WHERE ...',
     @DatabaseName = 'MyDatabase';
 
 -- Index maintenance (dry run, then execute)
-EXEC indexing.sp_IndexMaintenance @Execute = 0;  -- Preview
-EXEC indexing.sp_IndexMaintenance @Execute = 1;  -- Execute
+EXEC optimize.sp_IndexMaintenance @Execute = 0;  -- Preview
+EXEC optimize.sp_IndexMaintenance @Execute = 1;  -- Execute
 
 -- Statistics maintenance
 EXEC dbo.sp_StatisticsMaintenance @Run = 1, @StatisticsSample = 100;
 ```
 
 ## Key Features
+
+### @Databases — Ola Hallengren-Style Database Selection
+Flexible database targeting with keywords, wildcards, and exclusions:
+- `USER_DATABASES` — all user databases (default)
+- `SYSTEM_DATABASES` — master, msdb, model
+- `ALL_DATABASES` — everything
+- `AVAILABILITY_GROUP_DATABASES` — databases in AGs
+- `%pattern%` — wildcard matching
+- `-DbName` or `-%pattern%` — exclusions
+- Combine freely: `USER_DATABASES, -TestDb, -%_dev`
 
 ### Edition-Aware
 Automatically detects Enterprise vs Standard edition. Enterprise gets `WITH (ONLINE = ON)` for index operations and more aggressive rebuild thresholds (since online rebuilds don't block queries).

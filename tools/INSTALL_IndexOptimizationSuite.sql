@@ -1,11 +1,13 @@
-USE DBA_Utilities;
-GO
-
 /*
 ================================================================================
-  INDEX OPTIMIZATION SUITE - INSTALLATION SCRIPT
+  SQL Server Optimization Suite
+  Default Database: DBA_Utilities
 
-  Installs or updates all optimization suite objects in the indexing schema.
+  To install in a different database, find and replace all instances of
+  "DBA_Utilities" with your database name before running this script.
+================================================================================
+
+  Installs or updates all optimization suite objects in the optimize schema.
   Safe to re-run - tables are created only if missing, procs are always updated.
 
   Tools included:
@@ -21,9 +23,12 @@ GO
 ================================================================================
 */
 
+USE DBA_Utilities;
+GO
+
 -- Create schema if it doesn't exist
-IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = 'indexing')
-    EXEC('CREATE SCHEMA indexing');
+IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = 'optimize')
+    EXEC('CREATE SCHEMA optimize');
 GO
 
 PRINT 'Installing Index Optimization Suite...';
@@ -31,15 +36,143 @@ GO
 
 
 -- ==========================================================================
+-- SHARED: fn_GetDatabases (database selection parser)
+-- ==========================================================================
+
+/*
+    SQL Server Optimization Suite
+    Default Database: DBA_Utilities
+
+    To install in a different database, find and replace all instances of
+    "DBA_Utilities" with your database name before running this script.
+*/
+USE DBA_Utilities;
+GO
+
+CREATE OR ALTER FUNCTION optimize.fn_GetDatabases(@Databases NVARCHAR(MAX))
+RETURNS @Result TABLE (DatabaseName NVARCHAR(128))
+AS
+/*
+    Parses an Ola Hallengren-style database selection string into a list of database names.
+
+    Supported syntax:
+        NULL                          = USER_DATABASES (default)
+        USER_DATABASES                = All user databases
+        SYSTEM_DATABASES              = master, msdb, model
+        ALL_DATABASES                 = All databases
+        AVAILABILITY_GROUP_DATABASES  = Databases in AG
+        Db1                           = Single database
+        Db1, Db2                      = Multiple databases
+        %pattern%                     = Wildcard match
+        USER_DATABASES, -Db1          = All user databases except Db1
+        USER_DATABASES, -%test%       = All user databases excluding names matching %test%
+        ALL_DATABASES, -%Db%          = All databases not matching pattern
+
+    The hyphen (-) prefix excludes. The percent (%) is a wildcard. Comma separates tokens.
+*/
+BEGIN
+    DECLARE @Token NVARCHAR(256);
+    DECLARE @Include TABLE (DatabaseName NVARCHAR(128));
+    DECLARE @Exclude TABLE (Pattern NVARCHAR(256));
+    DECLARE @HasInclude BIT = 0;
+
+    -- Default to USER_DATABASES
+    IF @Databases IS NULL OR LTRIM(RTRIM(@Databases)) = ''
+        SET @Databases = 'USER_DATABASES';
+
+    -- Parse each comma-separated token
+    DECLARE @i INT = 1;
+    DECLARE @tokens TABLE (id INT IDENTITY(1,1), token NVARCHAR(256));
+    INSERT INTO @tokens (token)
+    SELECT LTRIM(RTRIM(value)) FROM STRING_SPLIT(@Databases, ',') WHERE LTRIM(RTRIM(value)) <> '';
+
+    DECLARE @maxId INT = (SELECT MAX(id) FROM @tokens);
+
+    WHILE @i <= @maxId
+    BEGIN
+        SELECT @Token = token FROM @tokens WHERE id = @i;
+
+        -- Exclusion token (starts with -)
+        IF LEFT(@Token, 1) = '-'
+        BEGIN
+            DECLARE @ExPattern NVARCHAR(256) = SUBSTRING(@Token, 2, LEN(@Token));
+            -- Expand keywords in exclusion
+            IF UPPER(@ExPattern) = 'AVAILABILITY_GROUP_DATABASES'
+                INSERT INTO @Exclude (Pattern)
+                SELECT d.name FROM sys.databases d
+                INNER JOIN sys.dm_hadr_availability_replica_states rs ON d.replica_id = rs.replica_id;
+            ELSE
+                INSERT INTO @Exclude (Pattern) VALUES (@ExPattern);
+        END
+        -- Include: keyword or pattern
+        ELSE
+        BEGIN
+            SET @HasInclude = 1;
+            IF UPPER(@Token) = 'USER_DATABASES'
+                INSERT INTO @Include (DatabaseName)
+                SELECT name FROM sys.databases
+                WHERE database_id > 4 AND state = 0 AND name <> 'tempdb';
+            ELSE IF UPPER(@Token) = 'SYSTEM_DATABASES'
+                INSERT INTO @Include (DatabaseName)
+                SELECT name FROM sys.databases
+                WHERE database_id <= 4 AND name <> 'tempdb' AND state = 0;
+            ELSE IF UPPER(@Token) = 'ALL_DATABASES'
+                INSERT INTO @Include (DatabaseName)
+                SELECT name FROM sys.databases
+                WHERE state = 0 AND name <> 'tempdb';
+            ELSE IF UPPER(@Token) = 'AVAILABILITY_GROUP_DATABASES'
+                INSERT INTO @Include (DatabaseName)
+                SELECT d.name FROM sys.databases d
+                INNER JOIN sys.dm_hadr_availability_replica_states rs ON d.replica_id = rs.replica_id
+                WHERE d.state = 0;
+            ELSE IF @Token LIKE '%[%]%'
+                INSERT INTO @Include (DatabaseName)
+                SELECT name FROM sys.databases
+                WHERE name LIKE @Token AND state = 0 AND name <> 'tempdb';
+            ELSE
+                INSERT INTO @Include (DatabaseName)
+                SELECT name FROM sys.databases
+                WHERE name = @Token AND state = 0;
+        END
+
+        SET @i = @i + 1;
+    END
+
+    -- Apply exclusions
+    INSERT INTO @Result (DatabaseName)
+    SELECT DISTINCT i.DatabaseName
+    FROM @Include i
+    WHERE NOT EXISTS (
+        SELECT 1 FROM @Exclude e
+        WHERE (e.Pattern LIKE '%[%]%' AND i.DatabaseName LIKE e.Pattern)
+           OR (e.Pattern NOT LIKE '%[%]%' AND i.DatabaseName = e.Pattern)
+    );
+
+    RETURN;
+END
+GO
+
+
+-- ==========================================================================
 -- DUPLICATE INDEX DETECTION
 -- ==========================================================================
 
+/*
+    SQL Server Optimization Suite
+    Default Database: DBA_Utilities
+
+    To install in a different database, find and replace all instances of
+    "DBA_Utilities" with your database name before running this script.
+*/
+USE DBA_Utilities;
+GO
+
 -- ==========================================================================
--- Table: indexing.IndexOptimizationResults
+-- Table: optimize.IndexOptimizationResults
 -- ==========================================================================
-IF OBJECT_ID('indexing.IndexOptimizationResults', 'U') IS NULL
+IF OBJECT_ID('optimize.IndexOptimizationResults', 'U') IS NULL
 BEGIN
-  CREATE TABLE indexing.IndexOptimizationResults
+  CREATE TABLE optimize.IndexOptimizationResults
     (IndexOptimizationId INT            IDENTITY(1, 1)
     ,ServerName          NVARCHAR(128)  NULL
     ,DatabaseName        NVARCHAR(128)  NOT NULL
@@ -76,17 +209,17 @@ END
 GO
 
 -- ==========================================================================
--- Proc: indexing.IndexOptimization_Insert
+-- Proc: optimize.IndexOptimization_Insert
 -- ==========================================================================
-CREATE OR ALTER PROCEDURE indexing.IndexOptimization_Insert
-  @DatabaseName NVARCHAR(MAX) = NULL
+CREATE OR ALTER PROCEDURE optimize.IndexOptimization_Insert
+  @Databases NVARCHAR(MAX) = NULL
 AS
   BEGIN
     SET NOCOUNT ON;
     SET QUOTED_IDENTIFIER ON;
     SET ANSI_NULLS ON;
 
-    DELETE FROM indexing.IndexOptimizationResults WHERE ResolvedDate IS NULL;
+    DELETE FROM optimize.IndexOptimizationResults WHERE ResolvedDate IS NULL;
 
     /* Collect live index data from all databases */
     DECLARE @d       INT
@@ -96,30 +229,9 @@ AS
     DROP TABLE IF EXISTS #DBs;
     CREATE TABLE #DBs (DatabaseName NVARCHAR(128), rn INT);
 
-    IF @DatabaseName IS NULL
-    BEGIN
-      INSERT INTO #DBs (DatabaseName, rn)
-      SELECT d.name, ROW_NUMBER() OVER (ORDER BY d.name)
-      FROM sys.databases d
-      WHERE d.state_desc = 'ONLINE'
-        AND d.database_id > 4;
-    END
-    ELSE IF @DatabaseName LIKE '%[%]%'
-    BEGIN
-      INSERT INTO #DBs (DatabaseName, rn)
-      SELECT d.name, ROW_NUMBER() OVER (ORDER BY d.name)
-      FROM sys.databases d
-      WHERE d.state_desc = 'ONLINE'
-        AND d.name LIKE @DatabaseName;
-    END
-    ELSE
-    BEGIN
-      INSERT INTO #DBs (DatabaseName, rn)
-      SELECT d.name, ROW_NUMBER() OVER (ORDER BY d.name)
-      FROM sys.databases d
-      INNER JOIN STRING_SPLIT(@DatabaseName, ',') s ON d.name = LTRIM(RTRIM(s.value))
-      WHERE d.state_desc = 'ONLINE';
-    END;
+    INSERT INTO #DBs (DatabaseName, rn)
+    SELECT DatabaseName, ROW_NUMBER() OVER (ORDER BY DatabaseName)
+    FROM optimize.fn_GetDatabases(@Databases);
 
     DROP TABLE IF EXISTS #ServerIndexes;
     CREATE TABLE #ServerIndexes
@@ -372,7 +484,7 @@ AS
            FROM #PKDuplicates) AS AllDups;
 
     /* Insert duplicates/redundants into results table*/
-    INSERT INTO indexing.IndexOptimizationResults (ServerName
+    INSERT INTO optimize.IndexOptimizationResults (ServerName
                                              ,DatabaseName
                                              ,SchemaName
                                              ,TableName
@@ -631,7 +743,7 @@ AS
                    WHERE names.CleanName = fc.BaseIndexName);
 
     /* Insert combinations into results table*/
-    INSERT INTO indexing.IndexOptimizationResults (ServerName
+    INSERT INTO optimize.IndexOptimizationResults (ServerName
                                              ,DatabaseName
                                              ,SchemaName
                                              ,TableName
@@ -690,7 +802,7 @@ AS
 
     DECLARE cmb_size_cursor CURSOR LOCAL FAST_FORWARD FOR
         SELECT IndexOptimizationId, DatabaseName, SchemaName, TableName, NewIndexKeys, NewIncludeColumns
-        FROM indexing.IndexOptimizationResults
+        FROM optimize.IndexOptimizationResults
         WHERE ResolvedDate IS NULL AND ActionType = 'COMBINE';
 
     OPEN cmb_size_cursor;
@@ -704,7 +816,7 @@ AS
         SET @cmbSchemaTable = QUOTENAME(@cmbSchema) + '.' + QUOTENAME(@cmbTable);
 
         BEGIN TRY
-            EXEC indexing.sp_GetHybridIndexSizeEstimate
+            EXEC optimize.sp_GetHybridIndexSizeEstimate
                 @DatabaseName      = @cmbDB,
                 @SchemaTable       = @cmbSchemaTable,
                 @RecKeyColumns     = @cmbKeys,
@@ -724,7 +836,7 @@ AS
         END CATCH
 
         IF @cmbEstGB IS NOT NULL
-            UPDATE indexing.IndexOptimizationResults SET EstimatedSizeGB = @cmbEstGB WHERE IndexOptimizationId = @cmbId;
+            UPDATE optimize.IndexOptimizationResults SET EstimatedSizeGB = @cmbEstGB WHERE IndexOptimizationId = @cmbId;
 
         FETCH NEXT FROM cmb_size_cursor INTO @cmbId, @cmbDB, @cmbSchema, @cmbTable, @cmbKeys, @cmbInc;
     END
@@ -736,7 +848,7 @@ AS
     DECLARE @statsSQL NVARCHAR(MAX);
 
     DECLARE db_cursor CURSOR LOCAL FAST_FORWARD FOR
-      SELECT DISTINCT DatabaseName FROM indexing.IndexOptimizationResults
+      SELECT DISTINCT DatabaseName FROM optimize.IndexOptimizationResults
       WHERE ResolvedDate IS NULL
         AND EXISTS (SELECT 1 FROM sys.databases WHERE name = DatabaseName);
 
@@ -760,7 +872,7 @@ AS
           LEFT JOIN sys.dm_db_index_usage_stats us ON i.object_id = us.object_id AND i.index_id = us.index_id AND us.database_id = DB_ID()
           WHERE o.type = ''U''
             AND EXISTS (
-              SELECT 1 FROM DBA_Utilities.indexing.IndexOptimizationResults r
+              SELECT 1 FROM DBA_Utilities.optimize.IndexOptimizationResults r
               WHERE r.DatabaseName = DB_NAME()
                 AND r.SchemaName = SCHEMA_NAME(o.schema_id)
                 AND r.TableName = o.name
@@ -776,7 +888,7 @@ AS
            ,Index2SizeKB    = s2.SizeKB
            ,Index2UserSeeks = ISNULL(s2.UserSeeks, 0)
            ,Index2UserScans = ISNULL(s2.UserScans, 0)
-        FROM DBA_Utilities.indexing.IndexOptimizationResults r
+        FROM DBA_Utilities.optimize.IndexOptimizationResults r
         LEFT JOIN IndexStats s1 ON s1.SchemaName = r.SchemaName AND s1.TableName = r.TableName AND s1.index_id = r.Index1Id
         LEFT JOIN IndexStats s2 ON s2.SchemaName = r.SchemaName AND s2.TableName = r.TableName AND s2.index_id = r.Index2Id
         WHERE r.DatabaseName = DB_NAME()
@@ -794,10 +906,10 @@ AS
 GO
 
 -- ==========================================================================
--- Proc: indexing.sp_DuplicateIndexOptimizationRecommendations
+-- Proc: optimize.sp_DuplicateIndexOptimizationRecommendations
 -- ==========================================================================
-CREATE OR ALTER PROCEDURE indexing.sp_DuplicateIndexOptimizationRecommendations
-  @DatabaseName  NVARCHAR(MAX)  = NULL
+CREATE OR ALTER PROCEDURE optimize.sp_DuplicateIndexOptimizationRecommendations
+  @Databases     NVARCHAR(MAX)  = NULL
  ,@TableName     NVARCHAR(128)  = NULL
  ,@ActionType    VARCHAR(20)    = NULL
  ,@RunnableUnder VARCHAR(20)    = NULL
@@ -807,7 +919,7 @@ BEGIN
   SET NOCOUNT ON;
 
   IF @RunAnalysis = 1
-    EXEC DBA_Utilities.indexing.IndexOptimization_Insert @DatabaseName = @DatabaseName;
+    EXEC optimize.IndexOptimization_Insert @Databases = @Databases;
 
   DECLARE @ScriptText NVARCHAR(MAX) = '';
   DECLARE @CRLF       CHAR(2)       = CHAR(13) + CHAR(10);
@@ -844,10 +956,8 @@ BEGIN
         ,@TotalRedundant   = SUM(CASE WHEN ActionType = 'REDUNDANT'       THEN 1 ELSE 0 END)
         ,@TotalDuplicatePK = SUM(CASE WHEN ActionType = 'DUPLICATE of PK' THEN 1 ELSE 0 END)
         ,@TotalCombine     = SUM(CASE WHEN ActionType = 'COMBINE'         THEN 1 ELSE 0 END)
-  FROM indexing.IndexOptimizationResults
-  WHERE (@DatabaseName IS NULL
-              OR (@DatabaseName LIKE '%[%]%' AND DatabaseName LIKE @DatabaseName)
-              OR (@DatabaseName NOT LIKE '%[%]%' AND DatabaseName IN (SELECT LTRIM(RTRIM(value)) FROM STRING_SPLIT(@DatabaseName, ','))))
+  FROM optimize.IndexOptimizationResults
+  WHERE DatabaseName IN (SELECT DatabaseName FROM optimize.fn_GetDatabases(@Databases))
     AND (@TableName    IS NULL OR TableName    = @TableName)
     AND (@ActionType   IS NULL OR ActionType   = @ActionType)
     AND ResolvedDate IS NULL
@@ -855,10 +965,8 @@ BEGIN
 
   SELECT @TotalDatabases = COUNT(DISTINCT DatabaseName)
         ,@TotalTables    = COUNT(DISTINCT DatabaseName + '.' + SchemaName + '.' + TableName)
-  FROM indexing.IndexOptimizationResults
-  WHERE (@DatabaseName IS NULL
-              OR (@DatabaseName LIKE '%[%]%' AND DatabaseName LIKE @DatabaseName)
-              OR (@DatabaseName NOT LIKE '%[%]%' AND DatabaseName IN (SELECT LTRIM(RTRIM(value)) FROM STRING_SPLIT(@DatabaseName, ','))))
+  FROM optimize.IndexOptimizationResults
+  WHERE DatabaseName IN (SELECT DatabaseName FROM optimize.fn_GetDatabases(@Databases))
     AND (@TableName    IS NULL OR TableName    = @TableName)
     AND (@ActionType   IS NULL OR ActionType   = @ActionType)
     AND ResolvedDate IS NULL
@@ -880,7 +988,7 @@ BEGIN
     + '    COMBINE:         ' + CAST(@TotalCombine AS VARCHAR(10)) + @CRLF
     + @CRLF
     + 'Filters:' + @CRLF
-    + '    @DatabaseName   = ' + ISNULL('''' + @DatabaseName + '''', 'ALL') + @CRLF
+    + '    @Databases      = ' + ISNULL('''' + @Databases + '''', 'ALL') + @CRLF
     + '    @TableName      = ' + ISNULL('''' + @TableName + '''', 'ALL') + @CRLF
     + '    @ActionType     = ' + ISNULL('''' + @ActionType + '''', 'ALL') + @CRLF
     + '    @RunnableUnder  = ' + ISNULL('''' + @RunnableUnder + '''', 'NULL (all uncommented)') + @CRLF
@@ -948,10 +1056,8 @@ BEGIN
           ,NewIndexName, NewIndexKeys, NewIncludeColumns, NewIndexNameExists
           ,CreateStatement, EstimatedSizeGB, DropStatement1, DropStatement2
           ,IndexUsageCommand, ProcessedDate
-    FROM indexing.IndexOptimizationResults
-    WHERE (@DatabaseName IS NULL
-              OR (@DatabaseName LIKE '%[%]%' AND DatabaseName LIKE @DatabaseName)
-              OR (@DatabaseName NOT LIKE '%[%]%' AND DatabaseName IN (SELECT LTRIM(RTRIM(value)) FROM STRING_SPLIT(@DatabaseName, ','))))
+    FROM optimize.IndexOptimizationResults
+    WHERE DatabaseName IN (SELECT DatabaseName FROM optimize.fn_GetDatabases(@Databases))
       AND (@TableName    IS NULL OR TableName    = @TableName)
       AND (@ActionType   IS NULL OR ActionType   = @ActionType)
       AND ResolvedDate IS NULL
@@ -1034,7 +1140,7 @@ BEGIN
       END;
 
       SET @ScriptText = @ScriptText + @DropStmt1 + @CRLF
-        + @CRLF + 'UPDATE DBA_Utilities.indexing.IndexOptimizationResults SET ResolvedDate = GETDATE() WHERE IndexOptimizationId = ' + CAST(@Id AS VARCHAR(10)) + ';' + @CRLF;
+        + @CRLF + 'UPDATE DBA_Utilities.optimize.IndexOptimizationResults SET ResolvedDate = GETDATE() WHERE IndexOptimizationId = ' + CAST(@Id AS VARCHAR(10)) + ';' + @CRLF;
       SET @RunnableCount = @RunnableCount + 1;
     END;
 
@@ -1115,7 +1221,7 @@ BEGIN
           + 'EXEC sp_rename N''' + @Schema + '.' + @Table + '.' + @NewIdxName + ''', N''' + REPLACE(@NewIdxName, '_NEW', '') + ''', N''INDEX''' + @CRLF;
 
       SET @ScriptText = @ScriptText
-        + @CRLF + 'UPDATE DBA_Utilities.indexing.IndexOptimizationResults SET ResolvedDate = GETDATE() WHERE IndexOptimizationId = ' + CAST(@Id AS VARCHAR(10)) + ';' + @CRLF;
+        + @CRLF + 'UPDATE DBA_Utilities.optimize.IndexOptimizationResults SET ResolvedDate = GETDATE() WHERE IndexOptimizationId = ' + CAST(@Id AS VARCHAR(10)) + ';' + @CRLF;
 
       IF @ShouldComment = 1
         SET @ScriptText = @ScriptText + '*/' + @CRLF;
@@ -1147,14 +1253,14 @@ BEGIN
 
   DECLARE @TotalUnfiltered INT;
   SELECT @TotalUnfiltered = COUNT(*)
-  FROM indexing.IndexOptimizationResults
+  FROM optimize.IndexOptimizationResults
   WHERE ResolvedDate IS NULL
     AND EXISTS (SELECT 1 FROM sys.databases WHERE name = DatabaseName);
 
   SELECT @@SERVERNAME                                AS ServerName
-        ,ISNULL(@DatabaseName, 'ALL')                AS DatabaseName
+        ,ISNULL(@Databases, 'ALL')                   AS DatabaseName
         ,GETDATE()                                   AS GeneratedDate
-        ,(SELECT MAX(ProcessedDate) FROM indexing.IndexOptimizationResults) AS LastAnalysisDate
+        ,(SELECT MAX(ProcessedDate) FROM optimize.IndexOptimizationResults) AS LastAnalysisDate
         ,@Statistics                                 AS [Statistics]
         ,CASE WHEN @RunnableCount > 0
               THEN 'Has Recommendations'
@@ -1176,12 +1282,22 @@ GO
 -- KEY LOOKUP ELIMINATION
 -- ==========================================================================
 
+/*
+    SQL Server Optimization Suite
+    Default Database: DBA_Utilities
+
+    To install in a different database, find and replace all instances of
+    "DBA_Utilities" with your database name before running this script.
+*/
+USE DBA_Utilities;
+GO
+
 -- =========================================================================
--- Table: indexing.KeyLookupResults
+-- Table: optimize.KeyLookupResults
 -- =========================================================================
-IF OBJECT_ID('indexing.KeyLookupResults', 'U') IS NULL
+IF OBJECT_ID('optimize.KeyLookupResults', 'U') IS NULL
 BEGIN
-    CREATE TABLE indexing.KeyLookupResults
+    CREATE TABLE optimize.KeyLookupResults
       (KeyLookupId          INT            IDENTITY(1, 1)
       ,ServerName           NVARCHAR(128)  NOT NULL
       ,DatabaseName         NVARCHAR(128)  NOT NULL
@@ -1208,17 +1324,17 @@ END
 GO
 
 -- =========================================================================
--- Proc: indexing.sp_KeyLookupAnalysis
+-- Proc: optimize.sp_KeyLookupAnalysis
 -- =========================================================================
-CREATE OR ALTER PROCEDURE indexing.sp_KeyLookupAnalysis
-  @DatabaseName   NVARCHAR(MAX) = NULL
+CREATE OR ALTER PROCEDURE optimize.sp_KeyLookupAnalysis
+  @Databases      NVARCHAR(MAX) = NULL
  ,@MinExecutions  BIGINT        = 100
  ,@TopPlans       INT           = 1000
 AS
 BEGIN
   SET NOCOUNT ON;
 
-  DELETE FROM indexing.KeyLookupResults WHERE ResolvedDate IS NULL;
+  DELETE FROM optimize.KeyLookupResults WHERE ResolvedDate IS NULL;
 
   -- Step 1: Collect all cached plans with Key Lookups (server-wide, one pass)
   DROP TABLE IF EXISTS #PlansWithLookups;
@@ -1269,32 +1385,10 @@ BEGIN
   DROP TABLE IF EXISTS #DBs;
   CREATE TABLE #DBs (DatabaseName NVARCHAR(128));
 
-  IF @DatabaseName IS NULL
-  BEGIN
-    INSERT INTO #DBs (DatabaseName)
-    SELECT d.name
-    FROM sys.databases d
-    WHERE d.state_desc = 'ONLINE'
-      AND d.database_id > 4;
-  END
-  ELSE IF @DatabaseName LIKE '%[%]%'
-  BEGIN
-    INSERT INTO #DBs (DatabaseName)
-    SELECT d.name
-    FROM sys.databases d
-    WHERE d.state_desc = 'ONLINE'
-      AND d.name LIKE @DatabaseName;
-  END
-  ELSE
-  BEGIN
-    INSERT INTO #DBs (DatabaseName)
-    SELECT d.name
-    FROM sys.databases d
-    INNER JOIN STRING_SPLIT(@DatabaseName, ',') s ON d.name = LTRIM(RTRIM(s.value))
-    WHERE d.state_desc = 'ONLINE';
-  END;
+  INSERT INTO #DBs (DatabaseName)
+  SELECT DatabaseName FROM optimize.fn_GetDatabases(@Databases);
 
-  INSERT INTO indexing.KeyLookupResults
+  INSERT INTO optimize.KeyLookupResults
     (ServerName, DatabaseName, SchemaName, TableName, NCIndexName
     ,LookupColumns, RecommendedIncludes, TotalExecutions, TotalLogicalReads
     ,AvgLogicalReads, PlanCount, SampleQueryText)
@@ -1357,7 +1451,7 @@ BEGIN
 
   DECLARE post_cursor CURSOR LOCAL FAST_FORWARD FOR
     SELECT KeyLookupId, DatabaseName, SchemaName, TableName, NCIndexName, LookupColumns
-    FROM indexing.KeyLookupResults
+    FROM optimize.KeyLookupResults
     WHERE ResolvedDate IS NULL;
 
   OPEN post_cursor;
@@ -1415,7 +1509,7 @@ BEGIN
     -- Skip unique and filtered indexes — cannot be safely modified
     IF @isUnique = 1 OR @hasFilter = 1
     BEGIN
-      DELETE FROM indexing.KeyLookupResults WHERE KeyLookupId = @id;
+      DELETE FROM optimize.KeyLookupResults WHERE KeyLookupId = @id;
       FETCH NEXT FROM post_cursor INTO @id, @db, @schema, @table, @ncIndex, @lookupCols;
       CONTINUE;
     END;
@@ -1423,7 +1517,7 @@ BEGIN
     -- Skip if index was not found (dropped/renamed since plan was compiled)
     IF @ncKeys IS NULL
     BEGIN
-      DELETE FROM indexing.KeyLookupResults WHERE KeyLookupId = @id;
+      DELETE FROM optimize.KeyLookupResults WHERE KeyLookupId = @id;
       FETCH NEXT FROM post_cursor INTO @id, @db, @schema, @table, @ncIndex, @lookupCols;
       CONTINUE;
     END;
@@ -1569,7 +1663,7 @@ BEGIN
           END
       END
 
-      UPDATE indexing.KeyLookupResults
+      UPDATE optimize.KeyLookupResults
       SET NCIndexKeys         = @ncKeys
          ,NCIndexIncludes     = @ncIncludes
          ,NCIndexSizeKB       = @sizeKB
@@ -1599,7 +1693,7 @@ BEGIN
     END
     ELSE
     BEGIN
-      DELETE FROM indexing.KeyLookupResults WHERE KeyLookupId = @id;
+      DELETE FROM optimize.KeyLookupResults WHERE KeyLookupId = @id;
     END;
 
     FETCH NEXT FROM post_cursor INTO @id, @db, @schema, @table, @ncIndex, @lookupCols;
@@ -1612,10 +1706,10 @@ END;
 GO
 
 -- =========================================================================
--- Proc: indexing.sp_KeyLookupRecommendations
+-- Proc: optimize.sp_KeyLookupRecommendations
 -- =========================================================================
-CREATE OR ALTER PROCEDURE indexing.sp_KeyLookupRecommendations
-  @DatabaseName   NVARCHAR(MAX) = NULL
+CREATE OR ALTER PROCEDURE optimize.sp_KeyLookupRecommendations
+  @Databases      NVARCHAR(MAX) = NULL
  ,@TableName      NVARCHAR(128) = NULL
  ,@RunnableUnder  VARCHAR(20)   = NULL  -- NULL=all uncommented, '2'=2GB both, '1,5e'=1GB Std/5GB Ent
  ,@RunAnalysis    BIT           = 0
@@ -1625,8 +1719,8 @@ BEGIN
   SET NOCOUNT ON;
 
   IF @RunAnalysis = 1
-    EXEC indexing.sp_KeyLookupAnalysis
-        @DatabaseName  = @DatabaseName
+    EXEC optimize.sp_KeyLookupAnalysis
+        @Databases     = @Databases
        ,@MinExecutions = @MinExecutions;
 
   DECLARE @ScriptText  NVARCHAR(MAX) = '';
@@ -1660,11 +1754,9 @@ BEGIN
   SELECT @TotalRecs      = COUNT(*)
         ,@TotalDatabases  = COUNT(DISTINCT DatabaseName)
         ,@TotalTables     = COUNT(DISTINCT DatabaseName + '.' + SchemaName + '.' + TableName)
-  FROM indexing.KeyLookupResults
+  FROM optimize.KeyLookupResults
   WHERE ResolvedDate IS NULL
-    AND (@DatabaseName IS NULL
-              OR (@DatabaseName LIKE '%[%]%' AND DatabaseName LIKE @DatabaseName)
-              OR (@DatabaseName NOT LIKE '%[%]%' AND DatabaseName IN (SELECT LTRIM(RTRIM(value)) FROM STRING_SPLIT(@DatabaseName, ','))))
+    AND DatabaseName IN (SELECT DatabaseName FROM optimize.fn_GetDatabases(@Databases))
     AND (@TableName    IS NULL OR TableName    = @TableName)
     AND EXISTS (SELECT 1 FROM sys.databases WHERE name = DatabaseName);
 
@@ -1681,7 +1773,7 @@ BEGIN
     + '    Recommendations:   ' + FORMAT(@TotalRecs, 'N0') + @CRLF
     + @CRLF
     + 'Filters:' + @CRLF
-    + '    @DatabaseName   = ' + ISNULL('''' + @DatabaseName + '''', 'ALL') + @CRLF
+    + '    @Databases      = ' + ISNULL('''' + @Databases + '''', 'ALL') + @CRLF
     + '    @TableName      = ' + ISNULL('''' + @TableName + '''', 'ALL') + @CRLF
     + '    @RunnableUnder  = ' + ISNULL('''' + @RunnableUnder + '''', 'NULL (all uncommented)') + @CRLF
     + '    @MinExecutions  = ' + CAST(@MinExecutions AS VARCHAR(20)) + @CRLF
@@ -1733,11 +1825,9 @@ BEGIN
           ,LookupColumns, RecommendedIncludes
           ,TotalExecutions, TotalLogicalReads, AvgLogicalReads
           ,PlanCount, NCIndexSizeKB, EstimatedSizeGB, CreateStatement, SampleQueryText
-    FROM indexing.KeyLookupResults
+    FROM optimize.KeyLookupResults
     WHERE ResolvedDate IS NULL
-      AND (@DatabaseName IS NULL
-              OR (@DatabaseName LIKE '%[%]%' AND DatabaseName LIKE @DatabaseName)
-              OR (@DatabaseName NOT LIKE '%[%]%' AND DatabaseName IN (SELECT LTRIM(RTRIM(value)) FROM STRING_SPLIT(@DatabaseName, ','))))
+      AND DatabaseName IN (SELECT DatabaseName FROM optimize.fn_GetDatabases(@Databases))
       AND (@TableName    IS NULL OR TableName    = @TableName)
       AND EXISTS (SELECT 1 FROM sys.databases WHERE name = DatabaseName)
     ORDER BY DatabaseName, TableName, TotalLogicalReads DESC;
@@ -1816,7 +1906,7 @@ BEGIN
     END;
 
     SET @ScriptText = @ScriptText
-      + @CRLF + 'UPDATE DBA_Utilities.indexing.KeyLookupResults SET ResolvedDate = GETDATE() WHERE KeyLookupId = ' + CAST(@Id AS VARCHAR(10)) + ';' + @CRLF;
+      + @CRLF + 'UPDATE DBA_Utilities.optimize.KeyLookupResults SET ResolvedDate = GETDATE() WHERE KeyLookupId = ' + CAST(@Id AS VARCHAR(10)) + ';' + @CRLF;
 
     IF @ShouldComment = 1
       SET @ScriptText = @ScriptText + '*/' + @CRLF;
@@ -1835,19 +1925,17 @@ BEGIN
 
   DECLARE @TotalUnfiltered INT;
   SELECT @TotalUnfiltered = COUNT(*)
-  FROM indexing.KeyLookupResults
+  FROM optimize.KeyLookupResults
   WHERE ResolvedDate IS NULL
     AND EXISTS (SELECT 1 FROM sys.databases WHERE name = DatabaseName);
 
   SELECT @@SERVERNAME                                AS ServerName
-        ,ISNULL(@DatabaseName, 'ALL')                AS DatabaseName
+        ,ISNULL(@Databases, 'ALL')                AS DatabaseName
         ,GETDATE()                                   AS GeneratedDate
         ,FORMAT(@TotalRecs, 'N0') + ' recommendations, '
-         + FORMAT(ISNULL((SELECT SUM(TotalLogicalReads) FROM indexing.KeyLookupResults
+         + FORMAT(ISNULL((SELECT SUM(TotalLogicalReads) FROM optimize.KeyLookupResults
                           WHERE ResolvedDate IS NULL
-                            AND (@DatabaseName IS NULL
-              OR (@DatabaseName LIKE '%[%]%' AND DatabaseName LIKE @DatabaseName)
-              OR (@DatabaseName NOT LIKE '%[%]%' AND DatabaseName IN (SELECT LTRIM(RTRIM(value)) FROM STRING_SPLIT(@DatabaseName, ','))))
+                            AND DatabaseName IN (SELECT DatabaseName FROM optimize.fn_GetDatabases(@Databases))
                             AND (@TableName IS NULL OR TableName = @TableName)), 0), 'N0')
          + ' total lookup reads'                     AS [Statistics]
         ,CASE WHEN @RunnableCount > 0
@@ -1870,12 +1958,22 @@ GO
 -- UNUSED INDEX DETECTION
 -- ==========================================================================
 
+/*
+    SQL Server Optimization Suite
+    Default Database: DBA_Utilities
+
+    To install in a different database, find and replace all instances of
+    "DBA_Utilities" with your database name before running this script.
+*/
+USE DBA_Utilities;
+GO
+
 -- =========================================================================
--- Table: indexing.UnusedIndexResults
+-- Table: optimize.UnusedIndexResults
 -- =========================================================================
-IF OBJECT_ID('indexing.UnusedIndexResults', 'U') IS NULL
+IF OBJECT_ID('optimize.UnusedIndexResults', 'U') IS NULL
 BEGIN
-    CREATE TABLE indexing.UnusedIndexResults
+    CREATE TABLE optimize.UnusedIndexResults
       (UnusedIndexId        INT            IDENTITY(1, 1)
       ,ServerName           NVARCHAR(128)  NOT NULL
       ,DatabaseName         NVARCHAR(128)  NOT NULL
@@ -1909,10 +2007,10 @@ END
 GO
 
 -- =========================================================================
--- Proc: indexing.sp_UnusedIndexAnalysis
+-- Proc: optimize.sp_UnusedIndexAnalysis
 -- =========================================================================
-CREATE OR ALTER PROCEDURE indexing.sp_UnusedIndexAnalysis
-  @DatabaseName       NVARCHAR(MAX)  = NULL
+CREATE OR ALTER PROCEDURE optimize.sp_UnusedIndexAnalysis
+  @Databases          NVARCHAR(MAX)  = NULL
  ,@WithQueryStore     BIT            = 0
  ,@Action             VARCHAR(10)    = 'DISABLE'
 AS
@@ -1923,35 +2021,14 @@ BEGIN
   IF @Action NOT IN ('DISABLE', 'DROP')
     SET @Action = 'DISABLE';
 
-  DELETE FROM indexing.UnusedIndexResults WHERE ResolvedDate IS NULL;
+  DELETE FROM optimize.UnusedIndexResults WHERE ResolvedDate IS NULL;
 
   DROP TABLE IF EXISTS #DBs;
   CREATE TABLE #DBs (DatabaseName NVARCHAR(128), rn INT);
 
-  IF @DatabaseName IS NULL
-  BEGIN
-    INSERT INTO #DBs (DatabaseName, rn)
-    SELECT d.name, ROW_NUMBER() OVER (ORDER BY d.name)
-    FROM sys.databases d
-    WHERE d.state_desc = 'ONLINE'
-      AND d.database_id > 4;
-  END
-  ELSE IF @DatabaseName LIKE '%[%]%'
-  BEGIN
-    INSERT INTO #DBs (DatabaseName, rn)
-    SELECT d.name, ROW_NUMBER() OVER (ORDER BY d.name)
-    FROM sys.databases d
-    WHERE d.state_desc = 'ONLINE'
-      AND d.name LIKE @DatabaseName;
-  END
-  ELSE
-  BEGIN
-    INSERT INTO #DBs (DatabaseName, rn)
-    SELECT d.name, ROW_NUMBER() OVER (ORDER BY d.name)
-    FROM sys.databases d
-    INNER JOIN STRING_SPLIT(@DatabaseName, ',') s ON d.name = LTRIM(RTRIM(s.value))
-    WHERE d.state_desc = 'ONLINE';
-  END;
+  INSERT INTO #DBs (DatabaseName, rn)
+  SELECT DatabaseName, ROW_NUMBER() OVER (ORDER BY DatabaseName)
+  FROM optimize.fn_GetDatabases(@Databases);
 
   DECLARE @ServerStartTime DATETIME;
   SELECT @ServerStartTime = sqlserver_start_time FROM sys.dm_os_sys_info;
@@ -2090,7 +2167,7 @@ BEGIN
     END;
 
     -- Phase 3: insert into results with computed confidence
-    INSERT INTO DBA_Utilities.indexing.UnusedIndexResults
+    INSERT INTO DBA_Utilities.optimize.UnusedIndexResults
       (ServerName, DatabaseName, SchemaName, TableName, IndexName
       ,IndexKeys, IndexIncludes, IndexSizeKB, IndexType
       ,IsUnique, HasFilter, FilterDefinition
@@ -2178,10 +2255,10 @@ END;
 GO
 
 -- =========================================================================
--- Proc: indexing.sp_UnusedIndexRecommendations
+-- Proc: optimize.sp_UnusedIndexRecommendations
 -- =========================================================================
-CREATE OR ALTER PROCEDURE indexing.sp_UnusedIndexRecommendations
-  @DatabaseName    NVARCHAR(MAX)  = NULL
+CREATE OR ALTER PROCEDURE optimize.sp_UnusedIndexRecommendations
+  @Databases       NVARCHAR(MAX)  = NULL
  ,@TableName       NVARCHAR(128)  = NULL
  ,@RunAnalysis       BIT            = 0
  ,@MinUpdateCount    BIGINT         = 100
@@ -2204,8 +2281,8 @@ BEGIN
   DECLARE @ConfidenceRank INT = CASE @Confidence WHEN 'LOW' THEN 1 WHEN 'MEDIUM' THEN 2 WHEN 'HIGH' THEN 3 END;
 
   IF @RunAnalysis = 1
-    EXEC indexing.sp_UnusedIndexAnalysis
-        @DatabaseName     = @DatabaseName
+    EXEC optimize.sp_UnusedIndexAnalysis
+        @Databases        = @Databases
        ,@WithQueryStore   = @WithQueryStore
        ,@Action           = @Action;
 
@@ -2224,11 +2301,9 @@ BEGIN
         ,@TotalDatabases  = COUNT(DISTINCT DatabaseName)
         ,@TotalTables     = COUNT(DISTINCT DatabaseName + '.' + SchemaName + '.' + TableName)
         ,@TotalSizeKB     = ISNULL(SUM(IndexSizeKB), 0)
-  FROM indexing.UnusedIndexResults
+  FROM optimize.UnusedIndexResults
   WHERE ResolvedDate IS NULL
-    AND (@DatabaseName IS NULL
-              OR (@DatabaseName LIKE '%[%]%' AND DatabaseName LIKE @DatabaseName)
-              OR (@DatabaseName NOT LIKE '%[%]%' AND DatabaseName IN (SELECT LTRIM(RTRIM(value)) FROM STRING_SPLIT(@DatabaseName, ','))))
+    AND DatabaseName IN (SELECT DatabaseName FROM optimize.fn_GetDatabases(@Databases))
     AND (@TableName    IS NULL OR TableName    = @TableName)
     AND UserUpdates   >= @MinUpdateCount
     AND ObservationDays >= @MinObservDays
@@ -2253,7 +2328,7 @@ BEGIN
     + '    Total Size:        ' + FORMAT(CAST(@TotalSizeKB / 1024.0 AS DECIMAL(10,1)), 'N1') + ' MB (' + FORMAT(@TotalSizeKB / 1048576.0, 'N2') + ' GB)' + @CRLF
     + @CRLF
     + 'Filters:' + @CRLF
-    + '    @DatabaseName    = ' + ISNULL('''' + @DatabaseName + '''', 'ALL') + @CRLF
+    + '    @Databases       = ' + ISNULL('''' + @Databases + '''', 'ALL') + @CRLF
     + '    @TableName       = ' + ISNULL('''' + @TableName + '''', 'ALL') + @CRLF
     + '    @MinUpdateCount  = ' + CAST(@MinUpdateCount AS VARCHAR(20)) + @CRLF
     + '    @MinObservDays   = ' + CAST(@MinObservDays AS VARCHAR(10)) + @CRLF
@@ -2306,11 +2381,9 @@ BEGIN
           ,UserUpdates, QueryStoreDays, QueryStorePlanCount
           ,ObservationSource, ObservationDays, Confidence
           ,DropStatement, RecreateStatement
-    FROM indexing.UnusedIndexResults
+    FROM optimize.UnusedIndexResults
     WHERE ResolvedDate IS NULL
-      AND (@DatabaseName IS NULL
-              OR (@DatabaseName LIKE '%[%]%' AND DatabaseName LIKE @DatabaseName)
-              OR (@DatabaseName NOT LIKE '%[%]%' AND DatabaseName IN (SELECT LTRIM(RTRIM(value)) FROM STRING_SPLIT(@DatabaseName, ','))))
+      AND DatabaseName IN (SELECT DatabaseName FROM optimize.fn_GetDatabases(@Databases))
       AND (@TableName    IS NULL OR TableName    = @TableName)
       AND UserUpdates   >= @MinUpdateCount
       AND ObservationDays >= @MinObservDays
@@ -2383,7 +2456,7 @@ BEGIN
 
       -- Mark resolved
       SET @ScriptText = @ScriptText
-        + @CRLF + 'UPDATE DBA_Utilities.indexing.UnusedIndexResults SET ResolvedDate = GETDATE() WHERE UnusedIndexId = ' + CAST(@Id AS VARCHAR(10)) + ';' + @CRLF;
+        + @CRLF + 'UPDATE DBA_Utilities.optimize.UnusedIndexResults SET ResolvedDate = GETDATE() WHERE UnusedIndexId = ' + CAST(@Id AS VARCHAR(10)) + ';' + @CRLF;
     END
     ELSE
     BEGIN
@@ -2394,7 +2467,7 @@ BEGIN
         SET @ScriptText = @ScriptText + @CRLF + '-- ' + @DropStmt + @CRLF;
 
       SET @ScriptText = @ScriptText
-        + @CRLF + '-- UPDATE DBA_Utilities.indexing.UnusedIndexResults SET ResolvedDate = GETDATE() WHERE UnusedIndexId = ' + CAST(@Id AS VARCHAR(10)) + ';' + @CRLF;
+        + @CRLF + '-- UPDATE DBA_Utilities.optimize.UnusedIndexResults SET ResolvedDate = GETDATE() WHERE UnusedIndexId = ' + CAST(@Id AS VARCHAR(10)) + ';' + @CRLF;
     END
 
     FETCH NEXT FROM rec_cursor INTO @Id, @DB, @Schema, @Table
@@ -2410,12 +2483,12 @@ BEGIN
 
   DECLARE @TotalUnfiltered INT;
   SELECT @TotalUnfiltered = COUNT(*)
-  FROM indexing.UnusedIndexResults
+  FROM optimize.UnusedIndexResults
   WHERE ResolvedDate IS NULL
     AND EXISTS (SELECT 1 FROM sys.databases WHERE name = DatabaseName);
 
   SELECT @@SERVERNAME                                AS ServerName
-        ,ISNULL(@DatabaseName, 'ALL')                AS DatabaseName
+        ,ISNULL(@Databases, 'ALL')                AS DatabaseName
         ,GETDATE()                                   AS GeneratedDate
         ,CAST(@TotalRecs AS VARCHAR(10)) + ' unused indexes, '
          + FORMAT(@TotalSizeKB, 'N0') + ' KB reclaimable'
@@ -2441,6 +2514,13 @@ GO
 -- MISSING INDEX RECOMMENDATIONS (optimize-index)
 -- ==========================================================================
 
+/*
+    SQL Server Optimization Suite
+    Default Database: DBA_Utilities
+
+    To install in a different database, find and replace all instances of
+    "DBA_Utilities" with your database name before running this script.
+*/
 -- =============================================
 -- REMOTE DEPLOYMENT: All-In-One Installation Script
 -- =============================================
@@ -2452,8 +2532,8 @@ GO
 -- Version: 5.0 - Generic database targeting (no MCVersion dependency)
 --
 -- FEATURES:
---   - @DatabaseName = NULL targets all user databases (database_id > 4)
---   - @DatabaseName supports comma-delimited list of specific databases
+--   - @Databases supports Ola Hallengren-style selection (USER_DATABASES, wildcards, exclusions)
+--   - @Databases = NULL defaults to USER_DATABASES
 --   - @RunnableUnder parameter for auto-executable scripts
 --   - Smart table size estimation (structural similarity)
 --   - Basic, Prefix, and Super-consolidation
@@ -2476,20 +2556,20 @@ PRINT ''
 -- =============================================
 
 -- Create schema if it doesn't exist
-IF NOT EXISTS (SELECT * FROM sys.schemas WHERE name = 'indexing')
+IF NOT EXISTS (SELECT * FROM sys.schemas WHERE name = 'optimize')
 BEGIN
-    EXEC('CREATE SCHEMA indexing');
-    PRINT 'Schema [indexing] created successfully.';
+    EXEC('CREATE SCHEMA optimize');
+    PRINT 'Schema [optimize] created successfully.';
 END
 ELSE
-    PRINT 'Schema [indexing] already exists.';
+    PRINT 'Schema [optimize] already exists.';
 GO
 
 -- Table: IndexRecommendations (loaded from CSV)
-IF OBJECT_ID('indexing.IndexRecommendations', 'U') IS NOT NULL
-    DROP TABLE indexing.IndexRecommendations;
+IF OBJECT_ID('optimize.IndexRecommendations', 'U') IS NOT NULL
+    DROP TABLE optimize.IndexRecommendations;
 
-CREATE TABLE indexing.IndexRecommendations (
+CREATE TABLE optimize.IndexRecommendations (
     RecommendationID INT IDENTITY(1,1) PRIMARY KEY,
     ServerName NVARCHAR(128),
     DatabaseName NVARCHAR(128),
@@ -2504,14 +2584,14 @@ CREATE TABLE indexing.IndexRecommendations (
     AvgTotalUserCost FLOAT,
     Impact DECIMAL(18,2)
 );
-PRINT 'Table indexing.IndexRecommendations created successfully.';
+PRINT 'Table optimize.IndexRecommendations created successfully.';
 GO
 
 -- Table: CurrentIndexes (loaded from CSV)
-IF OBJECT_ID('indexing.CurrentIndexes', 'U') IS NOT NULL
-    DROP TABLE indexing.CurrentIndexes;
+IF OBJECT_ID('optimize.CurrentIndexes', 'U') IS NOT NULL
+    DROP TABLE optimize.CurrentIndexes;
 
-CREATE TABLE indexing.CurrentIndexes (
+CREATE TABLE optimize.CurrentIndexes (
     IndexID INT IDENTITY(1,1) PRIMARY KEY,
     ServerName NVARCHAR(128),
     DatabaseName NVARCHAR(128),
@@ -2525,27 +2605,27 @@ CREATE TABLE indexing.CurrentIndexes (
     HasFilter BIT,
     IndexSizeMB DECIMAL(18,2)
 );
-PRINT 'Table indexing.CurrentIndexes created successfully.';
+PRINT 'Table optimize.CurrentIndexes created successfully.';
 GO
 
 -- Table: ServerInfo (loaded from CSV)
-IF OBJECT_ID('indexing.ServerInfo', 'U') IS NOT NULL
-    DROP TABLE indexing.ServerInfo;
+IF OBJECT_ID('optimize.ServerInfo', 'U') IS NOT NULL
+    DROP TABLE optimize.ServerInfo;
 
-CREATE TABLE indexing.ServerInfo (
+CREATE TABLE optimize.ServerInfo (
     ServerID INT IDENTITY(1,1) PRIMARY KEY,
     ServerName NVARCHAR(128),
     Edition NVARCHAR(128),
     IsEnterprise BIT DEFAULT 0
 );
-PRINT 'Table indexing.ServerInfo created successfully.';
+PRINT 'Table optimize.ServerInfo created successfully.';
 GO
 
 -- Table: ConsolidatedRecommendations (output from consolidation)
-IF OBJECT_ID('indexing.ConsolidatedRecommendations', 'U') IS NOT NULL
-    DROP TABLE indexing.ConsolidatedRecommendations;
+IF OBJECT_ID('optimize.ConsolidatedRecommendations', 'U') IS NOT NULL
+    DROP TABLE optimize.ConsolidatedRecommendations;
 
-CREATE TABLE indexing.ConsolidatedRecommendations (
+CREATE TABLE optimize.ConsolidatedRecommendations (
     GroupID INT IDENTITY(1,1) PRIMARY KEY,
     ServerName NVARCHAR(128),
     DatabaseName NVARCHAR(128),
@@ -2556,14 +2636,14 @@ CREATE TABLE indexing.ConsolidatedRecommendations (
     RecommendationCount INT,
     TotalIndexAdvantage DECIMAL(18,2)
 );
-PRINT 'Table indexing.ConsolidatedRecommendations created successfully.';
+PRINT 'Table optimize.ConsolidatedRecommendations created successfully.';
 GO
 
 -- Table: PrefixConsolidatedGroups (output from prefix consolidation)
-IF OBJECT_ID('indexing.PrefixConsolidatedGroups', 'U') IS NOT NULL
-    DROP TABLE indexing.PrefixConsolidatedGroups;
+IF OBJECT_ID('optimize.PrefixConsolidatedGroups', 'U') IS NOT NULL
+    DROP TABLE optimize.PrefixConsolidatedGroups;
 
-CREATE TABLE indexing.PrefixConsolidatedGroups (
+CREATE TABLE optimize.PrefixConsolidatedGroups (
     GroupID INT IDENTITY(1,1) PRIMARY KEY,
     ServerName NVARCHAR(128),
     DatabaseName NVARCHAR(128),
@@ -2576,14 +2656,14 @@ CREATE TABLE indexing.PrefixConsolidatedGroups (
     IsPrefixConsolidated BIT DEFAULT 0,
     OriginalGroupCount INT DEFAULT 1
 );
-PRINT 'Table indexing.PrefixConsolidatedGroups created successfully.';
+PRINT 'Table optimize.PrefixConsolidatedGroups created successfully.';
 GO
 
 -- Table: SuperConsolidatedGroups (output from super-consolidation)
-IF OBJECT_ID('indexing.SuperConsolidatedGroups', 'U') IS NOT NULL
-    DROP TABLE indexing.SuperConsolidatedGroups;
+IF OBJECT_ID('optimize.SuperConsolidatedGroups', 'U') IS NOT NULL
+    DROP TABLE optimize.SuperConsolidatedGroups;
 
-CREATE TABLE indexing.SuperConsolidatedGroups (
+CREATE TABLE optimize.SuperConsolidatedGroups (
     GroupID INT IDENTITY(1,1) PRIMARY KEY,
     ServerName NVARCHAR(128),
     DatabaseName NVARCHAR(128),
@@ -2596,14 +2676,14 @@ CREATE TABLE indexing.SuperConsolidatedGroups (
     IsSuperConsolidated BIT DEFAULT 0,
     OriginalGroupCount INT DEFAULT 1
 );
-PRINT 'Table indexing.SuperConsolidatedGroups created successfully.';
+PRINT 'Table optimize.SuperConsolidatedGroups created successfully.';
 GO
 
 -- Table: CleanedConsolidatedGroups (output after redundancy removal)
-IF OBJECT_ID('indexing.CleanedConsolidatedGroups', 'U') IS NOT NULL
-    DROP TABLE indexing.CleanedConsolidatedGroups;
+IF OBJECT_ID('optimize.CleanedConsolidatedGroups', 'U') IS NOT NULL
+    DROP TABLE optimize.CleanedConsolidatedGroups;
 
-CREATE TABLE indexing.CleanedConsolidatedGroups (
+CREATE TABLE optimize.CleanedConsolidatedGroups (
     GroupID INT IDENTITY(1,1) PRIMARY KEY,
     ServerName NVARCHAR(128),
     DatabaseName NVARCHAR(128),
@@ -2616,14 +2696,14 @@ CREATE TABLE indexing.CleanedConsolidatedGroups (
     IsSuperConsolidated BIT DEFAULT 0,
     OriginalGroupCount INT DEFAULT 1
 );
-PRINT 'Table indexing.CleanedConsolidatedGroups created successfully.';
+PRINT 'Table optimize.CleanedConsolidatedGroups created successfully.';
 GO
 
 -- Table: AnalysisResults (final analysis with strategies)
-IF OBJECT_ID('indexing.AnalysisResults', 'U') IS NOT NULL
-    DROP TABLE indexing.AnalysisResults;
+IF OBJECT_ID('optimize.AnalysisResults', 'U') IS NOT NULL
+    DROP TABLE optimize.AnalysisResults;
 
-CREATE TABLE indexing.AnalysisResults (
+CREATE TABLE optimize.AnalysisResults (
     ResultID INT IDENTITY(1,1) PRIMARY KEY,
     ServerName NVARCHAR(128),
     DatabaseName NVARCHAR(128),
@@ -2643,14 +2723,14 @@ CREATE TABLE indexing.AnalysisResults (
     IsSuperConsolidated BIT DEFAULT 0,
     OriginalGroupCount INT DEFAULT 1
 );
-PRINT 'Table indexing.AnalysisResults created successfully.';
+PRINT 'Table optimize.AnalysisResults created successfully.';
 GO
 
 -- Table: GeneratedScripts (final output)
-IF OBJECT_ID('indexing.GeneratedScripts', 'U') IS NOT NULL
-    DROP TABLE indexing.GeneratedScripts;
+IF OBJECT_ID('optimize.GeneratedScripts', 'U') IS NOT NULL
+    DROP TABLE optimize.GeneratedScripts;
 
-CREATE TABLE indexing.GeneratedScripts (
+CREATE TABLE optimize.GeneratedScripts (
     ScriptID INT IDENTITY(1,1) PRIMARY KEY,
     ServerName NVARCHAR(128),
     DatabaseName NVARCHAR(128),
@@ -2659,13 +2739,13 @@ CREATE TABLE indexing.GeneratedScripts (
     [Statistics] NVARCHAR(500),
     [Status] NVARCHAR(100)  -- Status: "No Recommendations", "Has Recommendations", "Nothing To Run Under Parameter"
 );
-PRINT 'Table indexing.GeneratedScripts created successfully.';
+PRINT 'Table optimize.GeneratedScripts created successfully.';
 GO
 
 -- Table: MissingIndexResults (persistent per-finding results with ResolvedDate tracking)
-IF OBJECT_ID('indexing.MissingIndexResults', 'U') IS NULL
+IF OBJECT_ID('optimize.MissingIndexResults', 'U') IS NULL
 BEGIN
-    CREATE TABLE indexing.MissingIndexResults (
+    CREATE TABLE optimize.MissingIndexResults (
         MissingIndexId        INT            IDENTITY(1, 1),
         ServerName            NVARCHAR(128)  NOT NULL,
         DatabaseName          NVARCHAR(128)  NOT NULL,
@@ -2689,10 +2769,10 @@ BEGIN
         ResolvedDate          DATETIME2(3)   NULL,
         CONSTRAINT PKC_MissingIndexResults PRIMARY KEY CLUSTERED (MissingIndexId DESC) WITH (FILLFACTOR = 100)
     );
-    PRINT 'Table indexing.MissingIndexResults created successfully.';
+    PRINT 'Table optimize.MissingIndexResults created successfully.';
 END
 ELSE
-    PRINT 'Table indexing.MissingIndexResults already exists - skipping.';
+    PRINT 'Table optimize.MissingIndexResults already exists - skipping.';
 GO
 
 PRINT '';
@@ -2704,11 +2784,11 @@ GO
 
 -- =============================================
 
-IF OBJECT_ID('indexing.fn_ContainsAllColumns', 'FN') IS NOT NULL
-    DROP FUNCTION indexing.fn_ContainsAllColumns;
+IF OBJECT_ID('optimize.fn_ContainsAllColumns', 'FN') IS NOT NULL
+    DROP FUNCTION optimize.fn_ContainsAllColumns;
 GO
 
-CREATE FUNCTION indexing.fn_ContainsAllColumns
+CREATE FUNCTION optimize.fn_ContainsAllColumns
 (
     @SupersetColumns NVARCHAR(MAX),  -- e.g., '[col1], [col2], [col3]'
     @SubsetColumns NVARCHAR(MAX)     -- e.g., '[col1], [col3]'
@@ -2768,8 +2848,8 @@ GO
 
 -- =============================================
 
-IF OBJECT_ID('indexing.fn_AreIncludesCompatible', 'FN') IS NOT NULL
-    DROP FUNCTION indexing.fn_AreIncludesCompatible;
+IF OBJECT_ID('optimize.fn_AreIncludesCompatible', 'FN') IS NOT NULL
+    DROP FUNCTION optimize.fn_AreIncludesCompatible;
 GO
 
 SET ANSI_NULLS ON
@@ -2778,7 +2858,7 @@ GO
 SET QUOTED_IDENTIFIER ON
 GO
 
-CREATE FUNCTION indexing.fn_AreIncludesCompatible(
+CREATE FUNCTION optimize.fn_AreIncludesCompatible(
     @Includes1 NVARCHAR(MAX),
     @Includes2 NVARCHAR(MAX)
 )
@@ -2840,8 +2920,8 @@ GO
 
 -- =============================================
 
-IF OBJECT_ID('indexing.fn_CanSuperConsolidateGroups', 'FN') IS NOT NULL
-    DROP FUNCTION indexing.fn_CanSuperConsolidateGroups;
+IF OBJECT_ID('optimize.fn_CanSuperConsolidateGroups', 'FN') IS NOT NULL
+    DROP FUNCTION optimize.fn_CanSuperConsolidateGroups;
 GO
 
 SET ANSI_NULLS ON
@@ -2850,7 +2930,7 @@ GO
 SET QUOTED_IDENTIFIER ON
 GO
 
-CREATE FUNCTION indexing.fn_CanSuperConsolidateGroups(
+CREATE FUNCTION optimize.fn_CanSuperConsolidateGroups(
     @SuperGroupIncludes NVARCHAR(MAX),
     @SuperGroupFirstKey NVARCHAR(128),
     @CandidateIncludes NVARCHAR(MAX),
@@ -2860,7 +2940,7 @@ RETURNS BIT
 AS
 BEGIN
     -- Must have compatible includes (same or subset/superset relationship)
-    IF indexing.fn_AreIncludesCompatible(@SuperGroupIncludes, @CandidateIncludes) = 0
+    IF optimize.fn_AreIncludesCompatible(@SuperGroupIncludes, @CandidateIncludes) = 0
         RETURN 0;
 
     -- NEW LOGIC (2026-02-27): No first-key matching requirement!
@@ -2880,8 +2960,8 @@ GO
 
 -- =============================================
 
-IF OBJECT_ID('indexing.fn_SuperGroupCoversIndividual', 'FN') IS NOT NULL
-    DROP FUNCTION indexing.fn_SuperGroupCoversIndividual;
+IF OBJECT_ID('optimize.fn_SuperGroupCoversIndividual', 'FN') IS NOT NULL
+    DROP FUNCTION optimize.fn_SuperGroupCoversIndividual;
 GO
 
 SET ANSI_NULLS ON
@@ -2890,7 +2970,7 @@ GO
 SET QUOTED_IDENTIFIER ON
 GO
 
-CREATE FUNCTION indexing.fn_SuperGroupCoversIndividual(
+CREATE FUNCTION optimize.fn_SuperGroupCoversIndividual(
     @SuperGroupKeys NVARCHAR(MAX),
     @SuperGroupIncludes NVARCHAR(MAX),
     @IndividualKeys NVARCHAR(MAX),
@@ -2974,11 +3054,11 @@ GO
 
 -- =============================================
 
-IF OBJECT_ID('indexing.fn_KeyIncludeCoversGroup', 'FN') IS NOT NULL
-    DROP FUNCTION indexing.fn_KeyIncludeCoversGroup;
+IF OBJECT_ID('optimize.fn_KeyIncludeCoversGroup', 'FN') IS NOT NULL
+    DROP FUNCTION optimize.fn_KeyIncludeCoversGroup;
 GO
 
-CREATE FUNCTION indexing.fn_KeyIncludeCoversGroup(
+CREATE FUNCTION optimize.fn_KeyIncludeCoversGroup(
     @CoveringKeys NVARCHAR(MAX),
     @CoveringIncludes NVARCHAR(MAX),
     @CoveredKeys NVARCHAR(MAX),
@@ -3105,11 +3185,11 @@ GO
 
 -- =============================================
 
-IF OBJECT_ID('indexing.fn_IsLeftmostPrefix', 'FN') IS NOT NULL
-    DROP FUNCTION indexing.fn_IsLeftmostPrefix;
+IF OBJECT_ID('optimize.fn_IsLeftmostPrefix', 'FN') IS NOT NULL
+    DROP FUNCTION optimize.fn_IsLeftmostPrefix;
 GO
 
-CREATE FUNCTION indexing.fn_IsLeftmostPrefix(
+CREATE FUNCTION optimize.fn_IsLeftmostPrefix(
     @PrefixKeys NVARCHAR(MAX),
     @FullKeys NVARCHAR(MAX)
 )
@@ -3201,11 +3281,11 @@ GO
 
 -- =============================================
 
-IF OBJECT_ID('indexing.fn_ContainsAllKeys', 'FN') IS NOT NULL
-    DROP FUNCTION indexing.fn_ContainsAllKeys;
+IF OBJECT_ID('optimize.fn_ContainsAllKeys', 'FN') IS NOT NULL
+    DROP FUNCTION optimize.fn_ContainsAllKeys;
 GO
 
-CREATE FUNCTION indexing.fn_ContainsAllKeys(
+CREATE FUNCTION optimize.fn_ContainsAllKeys(
     @ExistingKeys NVARCHAR(MAX),  -- Comma-separated key columns: '[col1], [col2], [col3]'
     @NeededKeys NVARCHAR(MAX)     -- Comma-separated key columns: '[col2]' or '[col2], [col3]'
 )
@@ -3267,11 +3347,11 @@ GO
 
 -- =============================================
 
-IF OBJECT_ID('indexing.fn_FindRedundantDisabledIndexes', 'TF') IS NOT NULL
-    DROP FUNCTION indexing.fn_FindRedundantDisabledIndexes;
+IF OBJECT_ID('optimize.fn_FindRedundantDisabledIndexes', 'TF') IS NOT NULL
+    DROP FUNCTION optimize.fn_FindRedundantDisabledIndexes;
 GO
 
-CREATE FUNCTION indexing.fn_FindRedundantDisabledIndexes(
+CREATE FUNCTION optimize.fn_FindRedundantDisabledIndexes(
     @DatabaseName NVARCHAR(128),
     @SchemaTable NVARCHAR(512),
     @NewKeyColumns NVARCHAR(MAX),
@@ -3299,7 +3379,7 @@ BEGIN
         ci.IsPrimaryKey,
         ci.IsUnique,
         ci.HasFilter
-    FROM indexing.CurrentIndexes ci
+    FROM optimize.CurrentIndexes ci
     WHERE ci.DatabaseName = @DatabaseName
       AND ci.SchemaTable = @SchemaTable
       AND ci.IsDisabled = 1  -- Only disabled indexes
@@ -3325,20 +3405,20 @@ BEGIN
           ci.IncludedColumns = ''
           OR
           -- All includes are covered by new index's keys
-          indexing.fn_ContainsAllColumns(@NewKeyColumns, ci.IncludedColumns) = 1
+          optimize.fn_ContainsAllColumns(@NewKeyColumns, ci.IncludedColumns) = 1
           OR
           -- All includes are covered by new index's includes
-          indexing.fn_ContainsAllColumns(@NewIncludedColumns, ci.IncludedColumns) = 1
+          optimize.fn_ContainsAllColumns(@NewIncludedColumns, ci.IncludedColumns) = 1
           OR
           -- All includes are covered by combination of keys + includes
-          indexing.fn_ContainsAllColumns(@NewKeyColumns + ISNULL(', ' + @NewIncludedColumns, ''), ci.IncludedColumns) = 1
+          optimize.fn_ContainsAllColumns(@NewKeyColumns + ISNULL(', ' + @NewIncludedColumns, ''), ci.IncludedColumns) = 1
       );
 
     RETURN;
 END
 GO
 
-PRINT 'Function indexing.fn_FindRedundantDisabledIndexes created successfully.';
+PRINT 'Function optimize.fn_FindRedundantDisabledIndexes created successfully.';
 GO
 
 GO
@@ -3349,11 +3429,11 @@ GO
 -- Version: 1.0
 -- =============================================
 
-IF OBJECT_ID('indexing.sp_GetSmartTableSizeEstimate', 'P') IS NOT NULL
-    DROP PROCEDURE indexing.sp_GetSmartTableSizeEstimate;
+IF OBJECT_ID('optimize.sp_GetSmartTableSizeEstimate', 'P') IS NOT NULL
+    DROP PROCEDURE optimize.sp_GetSmartTableSizeEstimate;
 GO
 
-CREATE PROCEDURE indexing.sp_GetSmartTableSizeEstimate
+CREATE PROCEDURE optimize.sp_GetSmartTableSizeEstimate
     @DatabaseName NVARCHAR(128),
     @SchemaTable NVARCHAR(256),
     @RecKeyColumns NVARCHAR(MAX),
@@ -3402,7 +3482,7 @@ BEGIN
             ELSE LEN(IncludedColumns) - LEN(REPLACE(IncludedColumns, ',', '')) + 1
         END AS IncludeCount
     INTO #ValidIndexes
-    FROM indexing.CurrentIndexes
+    FROM optimize.CurrentIndexes
     WHERE DatabaseName = @DatabaseName
         AND SchemaTable = @SchemaTable
         AND IsDisabled != 1
@@ -3584,7 +3664,7 @@ GO
 -- Test the procedure
 /*
 DECLARE @SizeWarning NVARCHAR(MAX);
-EXEC indexing.sp_GetSmartTableSizeEstimate
+EXEC optimize.sp_GetSmartTableSizeEstimate
     'mc_npp_7779',
     '[dbo].[training_data]',
     '[complete_date]',
@@ -3597,8 +3677,8 @@ GO
 
 -- =============================================
 
-IF OBJECT_ID('indexing.sp_ConsolidateRecommendations', 'P') IS NOT NULL
-    DROP PROCEDURE indexing.sp_ConsolidateRecommendations;
+IF OBJECT_ID('optimize.sp_ConsolidateRecommendations', 'P') IS NOT NULL
+    DROP PROCEDURE optimize.sp_ConsolidateRecommendations;
 GO
 
 SET ANSI_NULLS ON
@@ -3607,7 +3687,7 @@ GO
 SET QUOTED_IDENTIFIER ON
 GO
 
-CREATE PROCEDURE indexing.sp_ConsolidateRecommendations
+CREATE PROCEDURE optimize.sp_ConsolidateRecommendations
     @Debug BIT = 0
 AS
 BEGIN
@@ -3621,11 +3701,11 @@ BEGIN
         IF @Debug = 1 PRINT 'Starting consolidation of recommendations...';
 
         -- Get original count
-        SELECT @OriginalCount = COUNT(*) FROM indexing.IndexRecommendations;
+        SELECT @OriginalCount = COUNT(*) FROM optimize.IndexRecommendations;
         IF @Debug = 1 PRINT '  > Original recommendations: ' + CAST(@OriginalCount AS VARCHAR(10));
 
         -- Clear consolidated table
-        TRUNCATE TABLE indexing.ConsolidatedRecommendations;
+        TRUNCATE TABLE optimize.ConsolidatedRecommendations;
 
         -- Step 1: Group by SchemaTable + KeyColumns
         -- Step 2: Combine INCLUDE columns (merge unique columns)
@@ -3643,7 +3723,7 @@ BEGIN
                 -- Collect all recommendation IDs in group
                 STRING_AGG(CAST(RecommendationID AS VARCHAR(10)), ',')
                     WITHIN GROUP (ORDER BY IndexAdvantage DESC) AS RecIDs
-            FROM indexing.IndexRecommendations
+            FROM optimize.IndexRecommendations
             GROUP BY ServerName, DatabaseName, SchemaTable, KeyColumns
         ),
         IncludeMerge AS (
@@ -3659,7 +3739,7 @@ BEGIN
                 -- CRITICAL: This preserves the exact column order from the primary recommendation
                 (
                     SELECT TOP 1 ir.IncludedColumns
-                    FROM indexing.IndexRecommendations ir
+                    FROM optimize.IndexRecommendations ir
                     WHERE ir.ServerName = g.ServerName
                         AND ir.DatabaseName = g.DatabaseName
                         AND ir.SchemaTable = g.SchemaTable
@@ -3669,7 +3749,7 @@ BEGIN
                 ) AS MergedIncludes
             FROM GroupedRecs g
         )
-        INSERT INTO indexing.ConsolidatedRecommendations (
+        INSERT INTO optimize.ConsolidatedRecommendations (
             ServerName, DatabaseName, SchemaTable, KeyColumns, IncludedColumns,
             RecommendationCount, TotalIndexAdvantage, OriginalRecommendationIDs
         )
@@ -3707,7 +3787,7 @@ BEGIN
                 LEFT(KeyColumns, 30) AS [Keys],
                 CAST(TotalIndexAdvantage AS DECIMAL(10,2)) AS TotalAdv,
                 LEFT(IncludedColumns, 40) AS [Includes]
-            FROM indexing.ConsolidatedRecommendations
+            FROM optimize.ConsolidatedRecommendations
             WHERE RecommendationCount > 1
             ORDER BY RecommendationCount DESC, TotalIndexAdvantage DESC;
         END
@@ -3729,8 +3809,8 @@ GO
 
 -- =============================================
 
-IF OBJECT_ID('indexing.sp_ApplyPrefixConsolidation', 'P') IS NOT NULL
-    DROP PROCEDURE indexing.sp_ApplyPrefixConsolidation;
+IF OBJECT_ID('optimize.sp_ApplyPrefixConsolidation', 'P') IS NOT NULL
+    DROP PROCEDURE optimize.sp_ApplyPrefixConsolidation;
 GO
 
 SET ANSI_NULLS ON
@@ -3739,7 +3819,7 @@ GO
 SET QUOTED_IDENTIFIER ON
 GO
 
-CREATE PROCEDURE indexing.sp_ApplyPrefixConsolidation
+CREATE PROCEDURE optimize.sp_ApplyPrefixConsolidation
     @Debug BIT = 0
 AS
 BEGIN
@@ -3748,10 +3828,10 @@ BEGIN
     IF @Debug = 1 PRINT '[PREFIX-CONSOLIDATION] Starting prefix and cross-coverage consolidation...';
 
     -- Create output table
-    IF OBJECT_ID('indexing.PrefixConsolidatedGroups', 'U') IS NOT NULL
-        DROP TABLE indexing.PrefixConsolidatedGroups;
+    IF OBJECT_ID('optimize.PrefixConsolidatedGroups', 'U') IS NOT NULL
+        DROP TABLE optimize.PrefixConsolidatedGroups;
 
-    CREATE TABLE indexing.PrefixConsolidatedGroups (
+    CREATE TABLE optimize.PrefixConsolidatedGroups (
         GroupID INT IDENTITY(1,1) PRIMARY KEY,
         ServerName NVARCHAR(128),
         DatabaseName NVARCHAR(128),
@@ -3797,7 +3877,7 @@ BEGIN
     DECLARE group_cursor CURSOR FOR
         SELECT ServerName, DatabaseName, SchemaTable, KeyColumns, IncludedColumns,
                OriginalRecommendationIDs, RecommendationCount, TotalIndexAdvantage
-        FROM indexing.ConsolidatedRecommendations
+        FROM optimize.ConsolidatedRecommendations
         ORDER BY TotalIndexAdvantage DESC;
 
     OPEN group_cursor;
@@ -3832,7 +3912,7 @@ BEGIN
         DECLARE candidate_cursor CURSOR FOR
             SELECT ServerName, DatabaseName, SchemaTable, KeyColumns, IncludedColumns,
                    OriginalRecommendationIDs, RecommendationCount, TotalIndexAdvantage
-            FROM indexing.ConsolidatedRecommendations
+            FROM optimize.ConsolidatedRecommendations
             WHERE ServerName = @CurrentServer
               AND DatabaseName = @CurrentDB
               AND SchemaTable = @CurrentTable
@@ -3860,7 +3940,7 @@ BEGIN
             -- HIGH IMPACT RULE: Check if current group has high-impact recommendations that would lose their position
             DECLARE @CurrentMaxImpact DECIMAL(18,2) = 0;
             SELECT @CurrentMaxImpact = MAX(Impact)
-            FROM indexing.IndexRecommendations
+            FROM optimize.IndexRecommendations
             WHERE ServerName = @CurrentServer
               AND DatabaseName = @CurrentDB
               AND SchemaTable = @CurrentTable
@@ -3868,14 +3948,14 @@ BEGIN
 
             DECLARE @CandidateMaxImpact DECIMAL(18,2) = 0;
             SELECT @CandidateMaxImpact = MAX(Impact)
-            FROM indexing.IndexRecommendations
+            FROM optimize.IndexRecommendations
             WHERE ServerName = @CandidateServer
               AND DatabaseName = @CandidateDB
               AND SchemaTable = @CandidateTable
               AND KeyColumns = @CandidateKeys;
 
             -- Check for leftmost prefix consolidation (higher priority than cross-coverage)
-            IF indexing.fn_IsLeftmostPrefix(@CurrentKeys, @CandidateKeys) = 1
+            IF optimize.fn_IsLeftmostPrefix(@CurrentKeys, @CandidateKeys) = 1
             BEGIN
                 -- Current is a prefix of candidate - merge current into candidate (candidate is broader)
                 -- HIGH IMPACT CHECK: If current has high impact (>100000), keys must stay at position 1
@@ -3945,7 +4025,7 @@ BEGIN
 
                 SET @MergeHappened = 1;
             END
-            ELSE IF indexing.fn_IsLeftmostPrefix(@CandidateKeys, @CurrentKeys) = 1
+            ELSE IF optimize.fn_IsLeftmostPrefix(@CandidateKeys, @CurrentKeys) = 1
             BEGIN
                 -- Candidate is a prefix of current - merge candidate into current (current is broader)
                 -- HIGH IMPACT CHECK: If candidate has high impact (>100000), keys must stay at position 1
@@ -4015,7 +4095,7 @@ BEGIN
             -- IMPACT CONSTRAINT: Only allow cross-coverage if BOTH groups have low impact (<100k)
             -- High-impact queries need keys at position 1 to avoid table scans
             ELSE IF (@CurrentMaxImpact < 100000 AND @CandidateMaxImpact < 100000) AND
-                    indexing.fn_KeyIncludeCoversGroup(@CurrentKeys, @CurrentIncludes,
+                    optimize.fn_KeyIncludeCoversGroup(@CurrentKeys, @CurrentIncludes,
                                                   @CandidateKeys, @CandidateIncludes) = 1
             BEGIN
                 -- Current group can cover candidate - merge candidate into current (low-impact, coverage-based)
@@ -4084,7 +4164,7 @@ BEGIN
                 SET @MergeHappened = 1;
             END
             ELSE IF (@CurrentMaxImpact < 100000 AND @CandidateMaxImpact < 100000) AND
-                    indexing.fn_KeyIncludeCoversGroup(@CandidateKeys, @CandidateIncludes,
+                    optimize.fn_KeyIncludeCoversGroup(@CandidateKeys, @CandidateIncludes,
                                                        @CurrentKeys, @CurrentIncludes) = 1
             BEGIN
                 -- Candidate can cover current - merge current into candidate (low-impact, coverage-based)
@@ -4161,7 +4241,7 @@ BEGIN
         DEALLOCATE candidate_cursor;
 
         -- Insert the (possibly merged) current group into output
-        INSERT INTO indexing.PrefixConsolidatedGroups (
+        INSERT INTO optimize.PrefixConsolidatedGroups (
             ServerName, DatabaseName, SchemaTable, KeyColumns, IncludedColumns,
             OriginalRecommendationIDs, RecommendationCount, TotalIndexAdvantage,
             IsPrefixConsolidated, OriginalGroupCount
@@ -4183,9 +4263,9 @@ BEGIN
     -- Temp tables will be automatically dropped at procedure end
 
     -- Report results
-    DECLARE @OriginalCount INT = (SELECT COUNT(*) FROM indexing.ConsolidatedRecommendations);
-    DECLARE @PrefixCount INT = (SELECT COUNT(*) FROM indexing.PrefixConsolidatedGroups);
-    DECLARE @MergedCount INT = (SELECT COUNT(*) FROM indexing.PrefixConsolidatedGroups WHERE IsPrefixConsolidated = 1);
+    DECLARE @OriginalCount INT = (SELECT COUNT(*) FROM optimize.ConsolidatedRecommendations);
+    DECLARE @PrefixCount INT = (SELECT COUNT(*) FROM optimize.PrefixConsolidatedGroups);
+    DECLARE @MergedCount INT = (SELECT COUNT(*) FROM optimize.PrefixConsolidatedGroups WHERE IsPrefixConsolidated = 1);
 
     IF @Debug = 1
     BEGIN
@@ -4202,8 +4282,8 @@ GO
 
 -- =============================================
 
-IF OBJECT_ID('indexing.sp_ApplySuperConsolidation', 'P') IS NOT NULL
-    DROP PROCEDURE indexing.sp_ApplySuperConsolidation;
+IF OBJECT_ID('optimize.sp_ApplySuperConsolidation', 'P') IS NOT NULL
+    DROP PROCEDURE optimize.sp_ApplySuperConsolidation;
 GO
 
 SET ANSI_NULLS ON
@@ -4212,16 +4292,16 @@ GO
 SET QUOTED_IDENTIFIER ON
 GO
 
-CREATE PROCEDURE indexing.sp_ApplySuperConsolidation
+CREATE PROCEDURE optimize.sp_ApplySuperConsolidation
     @Debug BIT = 0
 AS
 BEGIN
     SET NOCOUNT ON;
 
     -- Create super-consolidated groups table
-    IF OBJECT_ID('indexing.SuperConsolidatedGroups', 'U') IS NOT NULL DROP TABLE indexing.SuperConsolidatedGroups;
+    IF OBJECT_ID('optimize.SuperConsolidatedGroups', 'U') IS NOT NULL DROP TABLE optimize.SuperConsolidatedGroups;
 
-    CREATE TABLE indexing.SuperConsolidatedGroups (
+    CREATE TABLE optimize.SuperConsolidatedGroups (
         GroupID INT IDENTITY(1,1) PRIMARY KEY,
         ServerName NVARCHAR(128),
         DatabaseName NVARCHAR(128),
@@ -4246,13 +4326,13 @@ BEGIN
     );
 
     -- Get count of prefix-consolidated groups to process
-    DECLARE @TotalGroups INT = (SELECT COUNT(*) FROM indexing.PrefixConsolidatedGroups);
+    DECLARE @TotalGroups INT = (SELECT COUNT(*) FROM optimize.PrefixConsolidatedGroups);
     IF @Debug = 1 PRINT '[SUPER-CONSOLIDATION] Analyzing ' + CAST(@TotalGroups AS VARCHAR(10)) + ' groups for super-consolidation';
 
     IF @TotalGroups <= 1
     BEGIN
         -- Nothing to super-consolidate, just copy to output table
-        INSERT INTO indexing.SuperConsolidatedGroups (
+        INSERT INTO optimize.SuperConsolidatedGroups (
             ServerName, DatabaseName, SchemaTable, KeyColumns, IncludedColumns,
             OriginalRecommendationIDs, RecommendationCount, TotalIndexAdvantage,
             IsSuperConsolidated, OriginalGroupCount
@@ -4261,7 +4341,7 @@ BEGIN
             ServerName, DatabaseName, SchemaTable, KeyColumns, IncludedColumns,
             OriginalRecommendationIDs, RecommendationCount, TotalIndexAdvantage,
             0, 1
-        FROM indexing.PrefixConsolidatedGroups;
+        FROM optimize.PrefixConsolidatedGroups;
 
         IF @Debug = 1 PRINT '[SUPER-CONSOLIDATION] Not enough groups to consolidate';
         RETURN;
@@ -4283,7 +4363,7 @@ BEGIN
             ROW_NUMBER() OVER (ORDER BY TotalIndexAdvantage DESC) AS RowID,
             ServerName, DatabaseName, SchemaTable, KeyColumns, IncludedColumns,
             OriginalRecommendationIDs, RecommendationCount, TotalIndexAdvantage
-        FROM indexing.PrefixConsolidatedGroups
+        FROM optimize.PrefixConsolidatedGroups
         ORDER BY TotalIndexAdvantage DESC;
 
     OPEN group_cursor;
@@ -4325,7 +4405,7 @@ BEGIN
         -- HIGH IMPACT CHECK: Skip super-consolidation if current group has high-impact recommendations
         DECLARE @CurrentHasHighImpact BIT = 0;
         IF EXISTS (
-            SELECT 1 FROM indexing.IndexRecommendations
+            SELECT 1 FROM optimize.IndexRecommendations
             WHERE ServerName = @CurrentServer
               AND DatabaseName = @DatabaseName
               AND SchemaTable = @SchemaTable
@@ -4338,7 +4418,7 @@ BEGIN
                                 ' has high impact - skipping super-consolidation';
 
             -- Skip super-consolidation for this group, add it as-is to output
-            INSERT INTO indexing.SuperConsolidatedGroups (
+            INSERT INTO optimize.SuperConsolidatedGroups (
                 ServerName, DatabaseName, SchemaTable, KeyColumns, IncludedColumns,
                 OriginalRecommendationIDs, RecommendationCount, TotalIndexAdvantage,
                 IsSuperConsolidated, OriginalGroupCount
@@ -4384,7 +4464,7 @@ BEGIN
             ROW_NUMBER() OVER (ORDER BY TotalIndexAdvantage DESC) AS RowID,
             KeyColumns, IncludedColumns, OriginalRecommendationIDs,
             RecommendationCount, TotalIndexAdvantage
-        FROM indexing.PrefixConsolidatedGroups
+        FROM optimize.PrefixConsolidatedGroups
         WHERE ServerName = @CurrentServer
           AND DatabaseName = @DatabaseName
           AND SchemaTable = @SchemaTable
@@ -4425,7 +4505,7 @@ BEGIN
             -- that would lose their key column position
             DECLARE @CandidateHasHighImpact BIT = 0;
             IF EXISTS (
-                SELECT 1 FROM indexing.IndexRecommendations
+                SELECT 1 FROM optimize.IndexRecommendations
                 WHERE ServerName = @CurrentServer
                   AND DatabaseName = @DatabaseName
                   AND SchemaTable = @SchemaTable
@@ -4437,7 +4517,7 @@ BEGIN
             END
 
             -- Check if this candidate can be super-consolidated with current group
-            IF indexing.fn_CanSuperConsolidateGroups(@IncludedColumns, @CurrentFirstKey,
+            IF optimize.fn_CanSuperConsolidateGroups(@IncludedColumns, @CurrentFirstKey,
                                                       @CandidateIncludes, @CandidateFirstKey) = 1
             BEGIN
                 -- HIGH IMPACT BLOCK: Don't super-consolidate if candidate has high impact
@@ -4506,7 +4586,7 @@ BEGIN
                 ir.IndexAdvantage,
                 ir.KeyColumns,
                 ir.IncludedColumns
-            FROM indexing.IndexRecommendations ir
+            FROM optimize.IndexRecommendations ir
             INNER JOIN #SuperGroupCandidates sc
                 ON ir.ServerName = @CurrentServer
                 AND ir.DatabaseName = @DatabaseName
@@ -4591,7 +4671,7 @@ BEGIN
             FROM #SuperGroupCandidates;
 
             -- Insert super-consolidated group
-            INSERT INTO indexing.SuperConsolidatedGroups (
+            INSERT INTO optimize.SuperConsolidatedGroups (
                 ServerName, DatabaseName, SchemaTable, KeyColumns, IncludedColumns,
                 OriginalRecommendationIDs, RecommendationCount, TotalIndexAdvantage,
                 IsSuperConsolidated, OriginalGroupCount
@@ -4612,7 +4692,7 @@ BEGIN
         ELSE
         BEGIN
             -- Single group, no consolidation possible
-            INSERT INTO indexing.SuperConsolidatedGroups (
+            INSERT INTO optimize.SuperConsolidatedGroups (
                 ServerName, DatabaseName, SchemaTable, KeyColumns, IncludedColumns,
                 OriginalRecommendationIDs, RecommendationCount, TotalIndexAdvantage,
                 IsSuperConsolidated, OriginalGroupCount
@@ -4642,8 +4722,8 @@ BEGIN
 
     -- Report results
     DECLARE @OriginalCount INT = @TotalGroups;
-    DECLARE @SuperCount INT = (SELECT COUNT(*) FROM indexing.SuperConsolidatedGroups);
-    DECLARE @SuperConsCount INT = (SELECT COUNT(*) FROM indexing.SuperConsolidatedGroups WHERE IsSuperConsolidated = 1);
+    DECLARE @SuperCount INT = (SELECT COUNT(*) FROM optimize.SuperConsolidatedGroups);
+    DECLARE @SuperConsCount INT = (SELECT COUNT(*) FROM optimize.SuperConsolidatedGroups WHERE IsSuperConsolidated = 1);
 
     IF @Debug = 1
     BEGIN
@@ -4660,8 +4740,8 @@ GO
 
 -- =============================================
 
-IF OBJECT_ID('indexing.sp_RemoveRedundantAfterSuperConsolidation', 'P') IS NOT NULL
-    DROP PROCEDURE indexing.sp_RemoveRedundantAfterSuperConsolidation;
+IF OBJECT_ID('optimize.sp_RemoveRedundantAfterSuperConsolidation', 'P') IS NOT NULL
+    DROP PROCEDURE optimize.sp_RemoveRedundantAfterSuperConsolidation;
 GO
 
 SET ANSI_NULLS ON
@@ -4670,16 +4750,16 @@ GO
 SET QUOTED_IDENTIFIER ON
 GO
 
-CREATE PROCEDURE indexing.sp_RemoveRedundantAfterSuperConsolidation
+CREATE PROCEDURE optimize.sp_RemoveRedundantAfterSuperConsolidation
     @Debug BIT = 0
 AS
 BEGIN
     SET NOCOUNT ON;
 
     -- Create cleaned groups table
-    IF OBJECT_ID('indexing.CleanedConsolidatedGroups', 'U') IS NOT NULL DROP TABLE indexing.CleanedConsolidatedGroups;
+    IF OBJECT_ID('optimize.CleanedConsolidatedGroups', 'U') IS NOT NULL DROP TABLE optimize.CleanedConsolidatedGroups;
 
-    CREATE TABLE indexing.CleanedConsolidatedGroups (
+    CREATE TABLE optimize.CleanedConsolidatedGroups (
         GroupID INT IDENTITY(1,1) PRIMARY KEY,
         ServerName NVARCHAR(128),
         DatabaseName NVARCHAR(128),
@@ -4693,14 +4773,14 @@ BEGIN
         OriginalGroupCount INT DEFAULT 1
     );
 
-    DECLARE @TotalGroups INT = (SELECT COUNT(*) FROM indexing.SuperConsolidatedGroups);
+    DECLARE @TotalGroups INT = (SELECT COUNT(*) FROM optimize.SuperConsolidatedGroups);
 
     IF @Debug = 1 PRINT '[POST-SUPER-CLEANUP] Analyzing ' + CAST(@TotalGroups AS VARCHAR(10)) + ' groups for redundancy cleanup';
 
     IF @TotalGroups <= 1
     BEGIN
         -- Nothing to clean up, just copy to output
-        INSERT INTO indexing.CleanedConsolidatedGroups (
+        INSERT INTO optimize.CleanedConsolidatedGroups (
             ServerName, DatabaseName, SchemaTable, KeyColumns, IncludedColumns,
             OriginalRecommendationIDs, RecommendationCount, TotalIndexAdvantage,
             IsSuperConsolidated, OriginalGroupCount
@@ -4709,7 +4789,7 @@ BEGIN
             ServerName, DatabaseName, SchemaTable, KeyColumns, IncludedColumns,
             OriginalRecommendationIDs, RecommendationCount, TotalIndexAdvantage,
             IsSuperConsolidated, OriginalGroupCount
-        FROM indexing.SuperConsolidatedGroups;
+        FROM optimize.SuperConsolidatedGroups;
 
         IF @Debug = 1 PRINT '[POST-SUPER-CLEANUP] Not enough groups to analyze for cleanup';
         RETURN;
@@ -4749,7 +4829,7 @@ BEGIN
     SELECT
         GroupID, ServerName, DatabaseName, SchemaTable, KeyColumns, IncludedColumns,
         OriginalRecommendationIDs, RecommendationCount, TotalIndexAdvantage, OriginalGroupCount
-    FROM indexing.SuperConsolidatedGroups
+    FROM optimize.SuperConsolidatedGroups
     WHERE IsSuperConsolidated = 1;
 
     -- Populate individual groups
@@ -4760,7 +4840,7 @@ BEGIN
     SELECT
         GroupID, ServerName, DatabaseName, SchemaTable, KeyColumns, IncludedColumns,
         OriginalRecommendationIDs, RecommendationCount, TotalIndexAdvantage
-    FROM indexing.SuperConsolidatedGroups
+    FROM optimize.SuperConsolidatedGroups
     WHERE IsSuperConsolidated = 0;
 
     DECLARE @SuperGroupCount INT = (SELECT COUNT(*) FROM @SuperGroups);
@@ -4772,7 +4852,7 @@ BEGIN
     IF @SuperGroupCount = 0
     BEGIN
         -- No super-groups, just copy all to output
-        INSERT INTO indexing.CleanedConsolidatedGroups (
+        INSERT INTO optimize.CleanedConsolidatedGroups (
             ServerName, DatabaseName, SchemaTable, KeyColumns, IncludedColumns,
             OriginalRecommendationIDs, RecommendationCount, TotalIndexAdvantage,
             IsSuperConsolidated, OriginalGroupCount
@@ -4781,7 +4861,7 @@ BEGIN
             ServerName, DatabaseName, SchemaTable, KeyColumns, IncludedColumns,
             OriginalRecommendationIDs, RecommendationCount, TotalIndexAdvantage,
             IsSuperConsolidated, OriginalGroupCount
-        FROM indexing.SuperConsolidatedGroups;
+        FROM optimize.SuperConsolidatedGroups;
 
         IF @Debug = 1 PRINT '[POST-SUPER-CLEANUP] No super-consolidated groups found, nothing to clean';
         RETURN;
@@ -4838,7 +4918,7 @@ BEGIN
           AND covering.ServerName = @SuperServer
           AND covering.DatabaseName = @SuperDB
           AND covering.SchemaTable = @SuperTable
-          AND indexing.fn_SuperGroupCoversIndividual(
+          AND optimize.fn_SuperGroupCoversIndividual(
                 covering.KeyColumns, covering.IncludedColumns,
                 @SuperKeys, @SuperIncludes
               ) = 1
@@ -4882,7 +4962,7 @@ BEGIN
     WHERE GroupID NOT IN (SELECT GroupID FROM @CoveredGroups);
 
     -- Copy non-redundant super-groups to cleaned groups
-    INSERT INTO indexing.CleanedConsolidatedGroups (
+    INSERT INTO optimize.CleanedConsolidatedGroups (
         ServerName, DatabaseName, SchemaTable, KeyColumns, IncludedColumns,
         OriginalRecommendationIDs, RecommendationCount, TotalIndexAdvantage,
         IsSuperConsolidated, OriginalGroupCount
@@ -4932,7 +5012,7 @@ BEGIN
 
         WHILE @@FETCH_STATUS = 0
         BEGIN
-            IF indexing.fn_SuperGroupCoversIndividual(@SuperKeys, @SuperIncludes, @IndivKeys, @IndivIncludes) = 1
+            IF optimize.fn_SuperGroupCoversIndividual(@SuperKeys, @SuperIncludes, @IndivKeys, @IndivIncludes) = 1
             BEGIN
                 SET @CoveredBySuper = 1;
                 IF @Debug = 1 PRINT '[POST-SUPER-CLEANUP] Individual group with key ' + @IndivKeys + ' covered by super-group';
@@ -4949,7 +5029,7 @@ BEGIN
         -- If not covered by any super-group, keep it
         IF @CoveredBySuper = 0
         BEGIN
-            INSERT INTO indexing.CleanedConsolidatedGroups (
+            INSERT INTO optimize.CleanedConsolidatedGroups (
                 ServerName, DatabaseName, SchemaTable, KeyColumns, IncludedColumns,
                 OriginalRecommendationIDs, RecommendationCount, TotalIndexAdvantage,
                 IsSuperConsolidated, OriginalGroupCount
@@ -4969,7 +5049,7 @@ BEGIN
     DEALLOCATE individual_cursor;
 
     -- Report results
-    DECLARE @CleanedCount INT = (SELECT COUNT(*) FROM indexing.CleanedConsolidatedGroups);
+    DECLARE @CleanedCount INT = (SELECT COUNT(*) FROM optimize.CleanedConsolidatedGroups);
     IF @Debug = 1 PRINT '[POST-SUPER-CLEANUP] Result: ' + CAST(@TotalGroups AS VARCHAR(10)) +
                         ' groups -> ' + CAST(@CleanedCount AS VARCHAR(10)) + ' groups (' +
                         CAST(@RemovedCount AS VARCHAR(10)) + ' redundant removed)';
@@ -4982,8 +5062,8 @@ GO
 
 -- =============================================
 
-IF OBJECT_ID('indexing.sp_AnalyzeIndexStrategies', 'P') IS NOT NULL
-    DROP PROCEDURE indexing.sp_AnalyzeIndexStrategies;
+IF OBJECT_ID('optimize.sp_AnalyzeIndexStrategies', 'P') IS NOT NULL
+    DROP PROCEDURE optimize.sp_AnalyzeIndexStrategies;
 GO
 
 SET ANSI_NULLS ON
@@ -4992,16 +5072,16 @@ GO
 SET QUOTED_IDENTIFIER ON
 GO
 
-CREATE PROCEDURE indexing.sp_AnalyzeIndexStrategies
+CREATE PROCEDURE optimize.sp_AnalyzeIndexStrategies
     @Debug BIT = 0
 AS
 BEGIN
     SET NOCOUNT ON;
 
     -- Drop and recreate analysis results table
-    IF OBJECT_ID('indexing.AnalysisResults', 'U') IS NOT NULL DROP TABLE indexing.AnalysisResults;
+    IF OBJECT_ID('optimize.AnalysisResults', 'U') IS NOT NULL DROP TABLE optimize.AnalysisResults;
 
-    CREATE TABLE indexing.AnalysisResults (
+    CREATE TABLE optimize.AnalysisResults (
         ResultID INT IDENTITY(1,1) PRIMARY KEY,
         ServerName NVARCHAR(128),
         DatabaseName NVARCHAR(128),
@@ -5025,19 +5105,19 @@ BEGIN
     IF @Debug = 1 PRINT 'Analyzing index strategies with SUPER-CONSOLIDATION...';
 
     -- Step 1: Consolidate recommendations first (group by key columns)
-    EXEC indexing.sp_ConsolidateRecommendations @Debug = @Debug;
+    EXEC optimize.sp_ConsolidateRecommendations @Debug = @Debug;
 
     -- Step 2: Apply prefix and cross-coverage consolidation (Python equivalent)
     IF @Debug = 1 PRINT '  > Applying prefix and cross-coverage consolidation...';
-    EXEC indexing.sp_ApplyPrefixConsolidation @Debug = @Debug;
+    EXEC optimize.sp_ApplyPrefixConsolidation @Debug = @Debug;
 
     -- Step 2.5: Apply super-consolidation (merge multiple groups into super-indexes)
     IF @Debug = 1 PRINT '  > Applying super-consolidation...';
-    EXEC indexing.sp_ApplySuperConsolidation @Debug = @Debug;
+    EXEC optimize.sp_ApplySuperConsolidation @Debug = @Debug;
 
     -- Step 2.7: Remove redundant operations covered by super-consolidated indexes
     IF @Debug = 1 PRINT '  > Removing redundant operations...';
-    EXEC indexing.sp_RemoveRedundantAfterSuperConsolidation @Debug = @Debug;
+    EXEC optimize.sp_RemoveRedundantAfterSuperConsolidation @Debug = @Debug;
 
     -- Step 3: For each cleaned consolidated recommendation, find matching existing indexes
     DECLARE @SchemaTable NVARCHAR(256);
@@ -5056,7 +5136,7 @@ BEGIN
         SELECT ServerName, DatabaseName, SchemaTable, KeyColumns, IncludedColumns,
                OriginalRecommendationIDs, RecommendationCount, TotalIndexAdvantage,
                IsSuperConsolidated, OriginalGroupCount
-        FROM indexing.CleanedConsolidatedGroups
+        FROM optimize.CleanedConsolidatedGroups
         ORDER BY TotalIndexAdvantage DESC;
 
     OPEN cons_cursor;
@@ -5085,7 +5165,7 @@ BEGIN
             @ExistingKeys = KeyColumns,
             @ExistingIncludes = IncludedColumns,
             @IsDisabled = IsDisabled
-        FROM indexing.CurrentIndexes
+        FROM optimize.CurrentIndexes
         WHERE DatabaseName = @DBName
             AND SchemaTable = @SchemaTable
             AND KeyColumns = @KeyCols
@@ -5099,7 +5179,7 @@ BEGIN
         BEGIN
             -- Check if existing includes contain all needed includes
             -- For REBUILD to be valid, the disabled index must already have all the columns we need
-            IF indexing.fn_ContainsAllColumns(@ExistingIncludes, @IncludeCols) = 1
+            IF optimize.fn_ContainsAllColumns(@ExistingIncludes, @IncludeCols) = 1
             BEGIN
                 -- Exact match on disabled index with sufficient includes - use REBUILD
                 SET @Strategy = 'REBUILD';
@@ -5126,7 +5206,7 @@ BEGIN
                 @ExistingKeys = KeyColumns,
                 @ExistingIncludes = IncludedColumns,
                 @IsDisabled = IsDisabled
-            FROM indexing.CurrentIndexes
+            FROM optimize.CurrentIndexes
             WHERE DatabaseName = @DBName
                 AND SchemaTable = @SchemaTable
                 AND IsDisabled = 0
@@ -5149,7 +5229,7 @@ BEGIN
                     IncludedColumns IS NULL OR
                     -- Or existing has some includes but doesn't have all needed ones
                     (IncludedColumns IS NOT NULL AND
-                     indexing.fn_ContainsAllColumns(IncludedColumns, @IncludeCols) = 0)
+                     optimize.fn_ContainsAllColumns(IncludedColumns, @IncludeCols) = 0)
                 )
             ORDER BY
                 -- Prefer exact match first, then shortest keys (fewest extra keys), then most includes (tie-breaker)
@@ -5183,7 +5263,7 @@ BEGIN
                     @ExistingKeys = KeyColumns,
                     @ExistingIncludes = IncludedColumns,
                     @IsDisabled = IsDisabled
-                FROM indexing.CurrentIndexes
+                FROM optimize.CurrentIndexes
                 WHERE DatabaseName = @DBName
                     AND SchemaTable = @SchemaTable
                     AND IsDisabled = 0
@@ -5209,7 +5289,7 @@ BEGIN
                         @ExistingKeys = KeyColumns,
                         @ExistingIncludes = IncludedColumns,
                         @IsDisabled = IsDisabled
-                    FROM indexing.CurrentIndexes
+                    FROM optimize.CurrentIndexes
                     WHERE DatabaseName = @DBName
                         AND SchemaTable = @SchemaTable
                         AND IsDisabled = 0
@@ -5221,7 +5301,7 @@ BEGIN
                         AND (
                             (@IncludeCols IS NULL) OR
                             (@IncludeCols IS NOT NULL AND IncludedColumns IS NOT NULL AND
-                             indexing.fn_ContainsAllColumns(IncludedColumns, @IncludeCols) = 1)
+                             optimize.fn_ContainsAllColumns(IncludedColumns, @IncludeCols) = 1)
                         )
                     ORDER BY LEN(KeyColumns);  -- Get shortest that still covers
 
@@ -5243,7 +5323,7 @@ BEGIN
                             @ExistingKeys = KeyColumns,
                             @ExistingIncludes = IncludedColumns,
                             @IsDisabled = IsDisabled
-                        FROM indexing.CurrentIndexes
+                        FROM optimize.CurrentIndexes
                         WHERE DatabaseName = @DBName
                             AND SchemaTable = @SchemaTable
                             AND IsDisabled = 0
@@ -5260,7 +5340,7 @@ BEGIN
                                 IncludedColumns IS NULL OR
                                 -- Or existing has some includes but doesn't have all needed ones
                                 (IncludedColumns IS NOT NULL AND
-                                 indexing.fn_ContainsAllColumns(IncludedColumns, @IncludeCols) = 0)
+                                 optimize.fn_ContainsAllColumns(IncludedColumns, @IncludeCols) = 0)
                             )
                         ORDER BY
                             -- Prefer shortest key list that contains needed keys
@@ -5292,7 +5372,7 @@ BEGIN
         END
 
         -- Insert analysis result
-        INSERT INTO indexing.AnalysisResults (
+        INSERT INTO optimize.AnalysisResults (
             ServerName, DatabaseName, SchemaTable, Strategy, ExistingIndexName,
             ExistingKeyColumns, ExistingIncludeColumns,
             KeyColumns, IncludedColumns, RecommendationIDs,
@@ -5317,13 +5397,13 @@ BEGIN
     IF @Debug = 1
     BEGIN
         DECLARE @CreateCnt INT, @RebuildCnt INT, @ExtendCnt INT, @UpdateCnt INT, @PrefixCnt INT, @SupersetCnt INT, @SuperConsCnt INT;
-        SELECT @CreateCnt = COUNT(*) FROM indexing.AnalysisResults WHERE Strategy IN ('CREATE', 'CREATE_CONSOLIDATED');
-        SELECT @RebuildCnt = COUNT(*) FROM indexing.AnalysisResults WHERE Strategy = 'REBUILD';
-        SELECT @ExtendCnt = COUNT(*) FROM indexing.AnalysisResults WHERE Strategy = 'EXTEND';
-        SELECT @UpdateCnt = COUNT(*) FROM indexing.AnalysisResults WHERE Strategy = 'UPDATE';
-        SELECT @PrefixCnt = COUNT(*) FROM indexing.AnalysisResults WHERE Strategy = 'PREFIX_MATCH';
-        SELECT @SupersetCnt = COUNT(*) FROM indexing.AnalysisResults WHERE Strategy = 'SUPERSET_COVERED';
-        SELECT @SuperConsCnt = COUNT(*) FROM indexing.AnalysisResults WHERE Strategy = 'CREATE_SUPER_CONSOLIDATED';
+        SELECT @CreateCnt = COUNT(*) FROM optimize.AnalysisResults WHERE Strategy IN ('CREATE', 'CREATE_CONSOLIDATED');
+        SELECT @RebuildCnt = COUNT(*) FROM optimize.AnalysisResults WHERE Strategy = 'REBUILD';
+        SELECT @ExtendCnt = COUNT(*) FROM optimize.AnalysisResults WHERE Strategy = 'EXTEND';
+        SELECT @UpdateCnt = COUNT(*) FROM optimize.AnalysisResults WHERE Strategy = 'UPDATE';
+        SELECT @PrefixCnt = COUNT(*) FROM optimize.AnalysisResults WHERE Strategy = 'PREFIX_MATCH';
+        SELECT @SupersetCnt = COUNT(*) FROM optimize.AnalysisResults WHERE Strategy = 'SUPERSET_COVERED';
+        SELECT @SuperConsCnt = COUNT(*) FROM optimize.AnalysisResults WHERE Strategy = 'CREATE_SUPER_CONSOLIDATED';
 
         PRINT '  > Strategy breakdown:';
         PRINT '    CREATE/CONSOLIDATED: ' + CAST(@CreateCnt AS VARCHAR(10));
@@ -5343,16 +5423,16 @@ GO
 
 -- =============================================
 
-IF OBJECT_ID('indexing.sp_GenerateOptimizationScript', 'P') IS NOT NULL
-    DROP PROCEDURE indexing.sp_GenerateOptimizationScript;
+IF OBJECT_ID('optimize.sp_GenerateOptimizationScript', 'P') IS NOT NULL
+    DROP PROCEDURE optimize.sp_GenerateOptimizationScript;
 GO
 
 SET QUOTED_IDENTIFIER ON;
 GO
 
-CREATE PROCEDURE indexing.sp_GenerateOptimizationScript
+CREATE PROCEDURE optimize.sp_GenerateOptimizationScript
     @ServerName NVARCHAR(128) = NULL,
-    @DatabaseName NVARCHAR(MAX) = NULL,  -- NULL = all user databases, or comma-delimited list
+    @Databases NVARCHAR(MAX) = NULL,  -- Ola-style: USER_DATABASES, %, exclusions with -, CSV
     @UseCSVForTesting BIT = 0,
     @OutputToTable BIT = 1,
     @Debug BIT = 0,
@@ -5395,7 +5475,7 @@ BEGIN
         -- Set defaults
         IF @ServerName IS NULL SET @ServerName = @@SERVERNAME;
 
-        SET @DatabaseLabel = ISNULL(@DatabaseName, 'ALL');
+        SET @DatabaseLabel = ISNULL(@Databases, 'ALL');
 
         -- Step 1 & 2: Collect Recommendations and Current Indexes
         IF @UseCSVForTesting = 1
@@ -5403,13 +5483,13 @@ BEGIN
             -- Load from CSV files (for testing)
             IF @Debug = 1 PRINT 'Step 1 & 2: Loading test data from CSV files...';
 
-            EXEC indexing.sp_LoadTestDataFromCSV
+            EXEC optimize.sp_LoadTestDataFromCSV
                 @CSVPath = 'D:\sites\claude\optimize-index\Python\Dev\input\',
                 @Debug = @Debug;
 
             -- Look up server edition from CSV data
             SELECT @ServerEdition = Edition
-            FROM indexing.ServerInfo
+            FROM optimize.ServerInfo
             WHERE ServerName = @ServerName;
 
             IF @ServerEdition IS NULL
@@ -5428,8 +5508,8 @@ BEGIN
             IF @ServerEdition LIKE '%Enterprise%' OR @ServerEdition LIKE '%Developer%'
                 SET @IsEnterprise = 1;
 
-            -- In production mode, use provided @DatabaseName or default to current DB
-            IF @DatabaseName IS NULL SET @DatabaseName = DB_NAME();
+            -- In production mode, use provided @Databases or default to current DB
+            IF @Databases IS NULL SET @Databases = DB_NAME();
         END
 
         IF @Debug = 1
@@ -5438,8 +5518,8 @@ BEGIN
             PRINT 'INDEX OPTIMIZATION SCRIPT GENERATOR V4.1';
             PRINT '========================================';
             PRINT 'Server: ' + @ServerName;
-            IF @DatabaseName IS NOT NULL
-                PRINT 'Database Filter: ' + @DatabaseName;
+            IF @Databases IS NOT NULL
+                PRINT 'Database Filter: ' + @Databases;
             PRINT 'Edition: ' + @ServerEdition + ' (Enterprise: ' + CAST(@IsEnterprise AS VARCHAR(1)) + ')';
             PRINT 'Testing Mode: ' + CAST(@UseCSVForTesting AS VARCHAR(1));
             PRINT 'Started: ' + CONVERT(VARCHAR(30), @StartTime, 120);
@@ -5449,8 +5529,8 @@ BEGIN
         IF @UseCSVForTesting = 1
         BEGIN
             DECLARE @TotalRecCount INT;  -- Total across all servers
-            SELECT @TotalRecCount = COUNT(*) FROM indexing.IndexRecommendations;
-            SELECT @IdxCount = COUNT(*) FROM indexing.CurrentIndexes;
+            SELECT @TotalRecCount = COUNT(*) FROM optimize.IndexRecommendations;
+            SELECT @IdxCount = COUNT(*) FROM optimize.CurrentIndexes;
 
             IF @Debug = 1
             BEGIN
@@ -5458,14 +5538,14 @@ BEGIN
                 PRINT '  > Loaded ' + CAST(@IdxCount AS VARCHAR(10)) + ' current indexes from CSV';
 
                 -- Show database breakdown
-                SELECT @DBCount = COUNT(DISTINCT DatabaseName) FROM indexing.IndexRecommendations;
+                SELECT @DBCount = COUNT(DISTINCT DatabaseName) FROM optimize.IndexRecommendations;
                 PRINT '  > Found ' + CAST(@DBCount AS VARCHAR(10)) + ' databases in recommendations';
 
                 PRINT '  > Database breakdown:';
                 DECLARE @DBName NVARCHAR(128), @DBRecCount INT;
                 DECLARE db_cursor CURSOR FOR
                     SELECT DatabaseName, COUNT(*) AS RecCount
-                    FROM indexing.IndexRecommendations
+                    FROM optimize.IndexRecommendations
                     GROUP BY DatabaseName
                     ORDER BY COUNT(*) DESC;
 
@@ -5484,11 +5564,11 @@ BEGIN
             IF @Debug = 1 PRINT '';
             IF @Debug = 1 PRINT 'Step 3: Analyzing recommendations and matching strategies...';
 
-            EXEC indexing.sp_AnalyzeIndexStrategies @Debug = @Debug;
+            EXEC optimize.sp_AnalyzeIndexStrategies @Debug = @Debug;
 
             -- Get count for THIS server only (for statistics)
             SELECT @RecCount = COUNT(*)
-            FROM indexing.IndexRecommendations
+            FROM optimize.IndexRecommendations
             WHERE ServerName = @ServerName;
         END
         ELSE
@@ -5500,7 +5580,7 @@ BEGIN
             -- Verify data exists and count total recommendations
             DECLARE @RowCount INT;
             SELECT @RowCount = COUNT(*), @RecCount = SUM(RecommendationCount)
-            FROM indexing.AnalysisResults
+            FROM optimize.AnalysisResults
             WHERE ServerName = @ServerName;
             IF @RowCount = 0
             BEGIN
@@ -5513,7 +5593,7 @@ BEGIN
                 -- Insert record showing no recommendations
                 IF @OutputToTable = 1
                 BEGIN
-                    INSERT INTO indexing.GeneratedScripts (ServerName, DatabaseName, ScriptText, [Statistics], [Status])
+                    INSERT INTO optimize.GeneratedScripts (ServerName, DatabaseName, ScriptText, [Statistics], [Status])
                     VALUES (@ServerName, @DatabaseLabel, NULL, 'No Recommendations', 'No Recommendations');
 
                     IF @Debug = 1 PRINT '  > Status saved to GeneratedScripts table (ScriptID: ' + CAST(SCOPE_IDENTITY() AS VARCHAR(10)) + ')';
@@ -5524,7 +5604,7 @@ BEGIN
 
             -- Look up server edition from ServerInfo table
             SELECT @ServerEdition = Edition
-            FROM indexing.ServerInfo
+            FROM optimize.ServerInfo
             WHERE ServerName = @ServerName;
 
             IF @ServerEdition IS NULL
@@ -5562,11 +5642,11 @@ BEGIN
         DECLARE @LargeTotalGB DECIMAL(18,2) = 0;  -- Total GB for operations exceeding threshold
 
         -- Count operations by strategy (for this server only)
-        SELECT @CreateCount = COUNT(*) FROM indexing.AnalysisResults WHERE ServerName = @ServerName AND Strategy IN ('CREATE', 'CREATE_CONSOLIDATED', 'CREATE_SUPER_CONSOLIDATED', 'PREFIX_MATCH', 'EXTEND_DISABLED');
-        SELECT @RebuildCount = COUNT(*) FROM indexing.AnalysisResults WHERE ServerName = @ServerName AND Strategy = 'REBUILD';
-        SELECT @ExtendCount = COUNT(*) FROM indexing.AnalysisResults WHERE ServerName = @ServerName AND Strategy IN ('EXTEND', 'UPDATE');  -- Both labeled as EXTEND in output
-        SELECT @SupersetCount = COUNT(*) FROM indexing.AnalysisResults WHERE ServerName = @ServerName AND Strategy = 'SUPERSET_COVERED';
-        SELECT @DBCount = COUNT(DISTINCT DatabaseName) FROM indexing.AnalysisResults WHERE ServerName = @ServerName;
+        SELECT @CreateCount = COUNT(*) FROM optimize.AnalysisResults WHERE ServerName = @ServerName AND Strategy IN ('CREATE', 'CREATE_CONSOLIDATED', 'CREATE_SUPER_CONSOLIDATED', 'PREFIX_MATCH', 'EXTEND_DISABLED');
+        SELECT @RebuildCount = COUNT(*) FROM optimize.AnalysisResults WHERE ServerName = @ServerName AND Strategy = 'REBUILD';
+        SELECT @ExtendCount = COUNT(*) FROM optimize.AnalysisResults WHERE ServerName = @ServerName AND Strategy IN ('EXTEND', 'UPDATE');  -- Both labeled as EXTEND in output
+        SELECT @SupersetCount = COUNT(*) FROM optimize.AnalysisResults WHERE ServerName = @ServerName AND Strategy = 'SUPERSET_COVERED';
+        SELECT @DBCount = COUNT(DISTINCT DatabaseName) FROM optimize.AnalysisResults WHERE ServerName = @ServerName;
 
         -- Initialize script text (statistics header will be added after loop)
         SET @ScriptText = '';
@@ -5575,7 +5655,7 @@ BEGIN
         DECLARE @TableCounts TABLE (DatabaseName NVARCHAR(128), TableCount INT);
         INSERT INTO @TableCounts (DatabaseName, TableCount)
         SELECT DatabaseName, COUNT(DISTINCT SchemaTable)
-        FROM indexing.AnalysisResults
+        FROM optimize.AnalysisResults
         WHERE ServerName = @ServerName
         GROUP BY DatabaseName;
 
@@ -5607,8 +5687,8 @@ BEGIN
         DECLARE @MIRTableName NVARCHAR(128);
 
         -- Clear unresolved MissingIndexResults for this server (re-analysis replaces pending findings; resolved history is preserved)
-        IF OBJECT_ID('indexing.MissingIndexResults', 'U') IS NOT NULL
-            DELETE FROM indexing.MissingIndexResults WHERE ServerName = @ServerName AND ResolvedDate IS NULL;
+        IF OBJECT_ID('optimize.MissingIndexResults', 'U') IS NOT NULL
+            DELETE FROM optimize.MissingIndexResults WHERE ServerName = @ServerName AND ResolvedDate IS NULL;
 
         -- Clean up any existing cursor from failed previous execution
         IF CURSOR_STATUS('global','results_cursor') >= -1
@@ -5622,7 +5702,7 @@ BEGIN
             SELECT DatabaseName, SchemaTable, Strategy, ExistingIndexName, ExistingKeyColumns, ExistingIncludeColumns,
                    IsDisabled, KeyColumns, IncludedColumns, RecommendationIDs, RecommendationCount,
                    IsSuperConsolidated, OriginalGroupCount, IndexAdvantage
-            FROM indexing.AnalysisResults
+            FROM optimize.AnalysisResults
             WHERE ServerName = @ServerName
             ORDER BY DatabaseName, SchemaTable, IndexAdvantage DESC;
 
@@ -5737,7 +5817,7 @@ BEGIN
 
                 DECLARE rebuild_rec_cursor CURSOR FOR
                     SELECT ir.RecommendationID
-                    FROM indexing.IndexRecommendations ir
+                    FROM optimize.IndexRecommendations ir
                     INNER JOIN (
                         SELECT CAST(T.c.value('.', 'NVARCHAR(10)') AS INT) AS RecID
                         FROM @RebuildXML.nodes('/i') T(c)
@@ -5753,7 +5833,7 @@ BEGIN
                     -- Get recommendation details
                     SELECT @RebuildRecAdvantage = IndexAdvantage, @RebuildRecImpact = Impact,
                            @RebuildRecKeyCols = KeyColumns, @RebuildRecIncludeCols = IncludedColumns
-                    FROM indexing.IndexRecommendations
+                    FROM optimize.IndexRecommendations
                     WHERE RecommendationID = @RebuildRecID
                       AND DatabaseName = @DBName;
 
@@ -5786,7 +5866,7 @@ BEGIN
 
                 -- Check for smart size warning
                 DECLARE @RebuildSizeWarning NVARCHAR(MAX);
-                EXEC indexing.sp_GetHybridIndexSizeEstimate @DBName, @Schema, @ExistingKeys, @ExistingIncludes, @RebuildSizeWarning OUTPUT, 0;
+                EXEC optimize.sp_GetHybridIndexSizeEstimate @DBName, @Schema, @ExistingKeys, @ExistingIncludes, @RebuildSizeWarning OUTPUT, 0;
 
                 -- Check if this operation should be commented out
                 DECLARE @ShouldCommentRebuild BIT = 0;
@@ -5870,7 +5950,7 @@ BEGIN
 
                 DECLARE extdis_rec_cursor CURSOR FOR
                     SELECT ir.RecommendationID
-                    FROM indexing.IndexRecommendations ir
+                    FROM optimize.IndexRecommendations ir
                     INNER JOIN (
                         SELECT CAST(T.c.value('.', 'NVARCHAR(10)') AS INT) AS RecID
                         FROM @ExtDisXML.nodes('/i') T(c)
@@ -5885,7 +5965,7 @@ BEGIN
                 BEGIN
                     SELECT @ExtDisRecAdvantage = IndexAdvantage, @ExtDisRecImpact = Impact,
                            @ExtDisRecKeyCols = KeyColumns, @ExtDisRecIncludeCols = IncludedColumns
-                    FROM indexing.IndexRecommendations
+                    FROM optimize.IndexRecommendations
                     WHERE RecommendationID = @ExtDisRecID AND DatabaseName = @DBName;
 
                     SET @ExtDisRecKeyCols = REPLACE(REPLACE(@ExtDisRecKeyCols, ', ', ','), ',', ', ');
@@ -5941,7 +6021,7 @@ BEGIN
 
                 -- Check for smart size warning
                 DECLARE @ExtDisSizeWarning NVARCHAR(MAX);
-                EXEC indexing.sp_GetHybridIndexSizeEstimate @DBName, @Schema, @KeyCols, @IncludeCols, @ExtDisSizeWarning OUTPUT, 0;
+                EXEC optimize.sp_GetHybridIndexSizeEstimate @DBName, @Schema, @KeyCols, @IncludeCols, @ExtDisSizeWarning OUTPUT, 0;
 
                 -- Check if this operation should be commented out
                 DECLARE @ShouldCommentExtDis BIT = 0;
@@ -6027,7 +6107,7 @@ BEGIN
 
                 DECLARE extend_rec_cursor CURSOR FOR
                     SELECT ir.RecommendationID
-                    FROM indexing.IndexRecommendations ir
+                    FROM optimize.IndexRecommendations ir
                     INNER JOIN (
                         SELECT CAST(T.c.value('.', 'NVARCHAR(10)') AS INT) AS RecID
                         FROM @ExtendXML.nodes('/i') T(c)
@@ -6043,7 +6123,7 @@ BEGIN
                     -- Get recommendation details
                     SELECT @ExtendRecAdvantage = IndexAdvantage, @ExtendRecImpact = Impact,
                            @ExtendRecKeyCols = KeyColumns, @ExtendRecIncludeCols = IncludedColumns
-                    FROM indexing.IndexRecommendations
+                    FROM optimize.IndexRecommendations
                     WHERE RecommendationID = @ExtendRecID
                       AND DatabaseName = @DBName;
 
@@ -6246,7 +6326,7 @@ BEGIN
 
                 -- Check for smart size warning (after @MergedIncludes is calculated)
                 DECLARE @SizeWarning NVARCHAR(MAX);
-                EXEC indexing.sp_GetHybridIndexSizeEstimate @DBName, @Schema, @ExistingKeys, @MergedIncludes, @SizeWarning OUTPUT, 0;
+                EXEC optimize.sp_GetHybridIndexSizeEstimate @DBName, @Schema, @ExistingKeys, @MergedIncludes, @SizeWarning OUTPUT, 0;
 
                 -- Check if this operation should be commented out
                 DECLARE @ShouldCommentSQL BIT = 0;
@@ -6290,7 +6370,7 @@ BEGIN
                         WHEN HasFilter = 1 THEN 'filtered index'
                         ELSE ''
                     END
-                FROM indexing.CurrentIndexes
+                FROM optimize.CurrentIndexes
                 WHERE DatabaseName = @DBName
                     AND SchemaTable = @Schema
                     AND IndexName = @ExistingIndexName;
@@ -6350,7 +6430,7 @@ BEGIN
 
                 DECLARE extend_redundant_cursor CURSOR FOR
                     SELECT IndexName, KeyColumns, IncludedColumns, IsPrimaryKey, IsUnique, HasFilter
-                    FROM indexing.fn_FindRedundantDisabledIndexes(@DBName, @Schema, @ExistingKeys, @MergedIncludes);
+                    FROM optimize.fn_FindRedundantDisabledIndexes(@DBName, @Schema, @ExistingKeys, @MergedIncludes);
 
                 OPEN extend_redundant_cursor;
                 FETCH NEXT FROM extend_redundant_cursor INTO @ExtRedundantName, @ExtRedundantKeys, @ExtRedundantIncludes, @ExtIsPrimaryKey, @ExtIsUnique, @ExtHasFilter;
@@ -6424,7 +6504,7 @@ BEGIN
 
                 DECLARE rec_cursor CURSOR FOR
                     SELECT ir.RecommendationID
-                    FROM indexing.IndexRecommendations ir
+                    FROM optimize.IndexRecommendations ir
                     INNER JOIN (
                         SELECT CAST(T.c.value('.', 'NVARCHAR(10)') AS INT) AS RecID
                         FROM @XML.nodes('/i') T(c)
@@ -6442,7 +6522,7 @@ BEGIN
                     -- Get recommendation details
                     SELECT @RecAdvantage = IndexAdvantage, @RecImpact = Impact,
                            @RecKeyCols = KeyColumns, @RecIncludeCols = IncludedColumns
-                    FROM indexing.IndexRecommendations
+                    FROM optimize.IndexRecommendations
                     WHERE RecommendationID = @RecID
                       AND DatabaseName = @DBName;
 
@@ -6501,7 +6581,7 @@ BEGIN
 
                 DECLARE prefix_rec_cursor CURSOR FOR
                     SELECT ir.RecommendationID
-                    FROM indexing.IndexRecommendations ir
+                    FROM optimize.IndexRecommendations ir
                     INNER JOIN (
                         SELECT CAST(T.c.value('.', 'NVARCHAR(10)') AS INT) AS RecID
                         FROM @PrefixXML.nodes('/i') T(c)
@@ -6519,7 +6599,7 @@ BEGIN
                     -- Get recommendation details
                     SELECT @PrefixRecAdvantage = IndexAdvantage, @PrefixRecImpact = Impact,
                            @PrefixRecKeyCols = KeyColumns, @PrefixRecIncludeCols = IncludedColumns
-                    FROM indexing.IndexRecommendations
+                    FROM optimize.IndexRecommendations
                     WHERE RecommendationID = @PrefixRecID
                       AND DatabaseName = @DBName;
 
@@ -6555,7 +6635,7 @@ BEGIN
 
                 -- Check for smart size warning
                 DECLARE @SizeWarning2 NVARCHAR(MAX);
-                EXEC indexing.sp_GetHybridIndexSizeEstimate @DBName, @Schema, @KeyCols, @IncludeCols, @SizeWarning2 OUTPUT, 0;
+                EXEC optimize.sp_GetHybridIndexSizeEstimate @DBName, @Schema, @KeyCols, @IncludeCols, @SizeWarning2 OUTPUT, 0;
 
                 -- Check if this operation should be commented out
                 DECLARE @ShouldCommentSQL2 BIT = 0;
@@ -6642,7 +6722,7 @@ BEGIN
 
                 DECLARE create_rec_cursor CURSOR FOR
                     SELECT ir.RecommendationID
-                    FROM indexing.IndexRecommendations ir
+                    FROM optimize.IndexRecommendations ir
                     INNER JOIN (
                         SELECT CAST(T.c.value('.', 'NVARCHAR(10)') AS INT) AS RecID
                         FROM @CreateXML.nodes('/i') T(c)
@@ -6658,7 +6738,7 @@ BEGIN
                     -- Get recommendation details
                     SELECT @CreateRecAdvantage = IndexAdvantage, @CreateRecImpact = Impact,
                            @CreateRecKeyCols = KeyColumns, @CreateRecIncludeCols = IncludedColumns
-                    FROM indexing.IndexRecommendations
+                    FROM optimize.IndexRecommendations
                     WHERE RecommendationID = @CreateRecID
                       AND DatabaseName = @DBName;
 
@@ -6699,7 +6779,7 @@ BEGIN
 
                 -- Check for smart size warning
                 DECLARE @SizeWarning3 NVARCHAR(MAX);
-                EXEC indexing.sp_GetHybridIndexSizeEstimate @DBName, @Schema, @KeyCols, @IncludeCols, @SizeWarning3 OUTPUT, 0;
+                EXEC optimize.sp_GetHybridIndexSizeEstimate @DBName, @Schema, @KeyCols, @IncludeCols, @SizeWarning3 OUTPUT, 0;
 
                 -- Check if this operation should be commented out
                 DECLARE @ShouldCommentSQL3 BIT = 0;
@@ -6754,7 +6834,7 @@ BEGIN
 
                 DECLARE redundant_cursor CURSOR FOR
                     SELECT IndexName, KeyColumns, IncludedColumns, IsPrimaryKey, IsUnique, HasFilter
-                    FROM indexing.fn_FindRedundantDisabledIndexes(@DBName, @Schema, @KeyCols, @IncludeCols);
+                    FROM optimize.fn_FindRedundantDisabledIndexes(@DBName, @Schema, @KeyCols, @IncludeCols);
 
                 OPEN redundant_cursor;
                 FETCH NEXT FROM redundant_cursor INTO @RedundantIndexName, @RedundantKeyColumns, @RedundantIncludeColumns, @IsPrimaryKeyIndex, @IsUniqueIndex, @HasFilterIndex;
@@ -6819,9 +6899,9 @@ BEGIN
             ELSE IF @Strategy IN ('CREATE', 'CREATE_CONSOLIDATED', 'CREATE_SUPER_CONSOLIDATED') AND @EstimatedGB3 IS NOT NULL
                 SET @EstimatedGBCurrent = @EstimatedGB3;
 
-            IF OBJECT_ID('indexing.MissingIndexResults', 'U') IS NOT NULL
+            IF OBJECT_ID('optimize.MissingIndexResults', 'U') IS NOT NULL
             BEGIN
-                INSERT INTO indexing.MissingIndexResults (
+                INSERT INTO optimize.MissingIndexResults (
                     ServerName, DatabaseName, SchemaName, TableName,
                     Strategy, ExistingIndexName, ExistingKeyColumns, ExistingIncludeColumns,
                     KeyColumns, IncludedColumns, IndexAdvantage, RecommendationCount,
@@ -6895,7 +6975,7 @@ BEGIN
 
             IF @OutputToTable = 1
             BEGIN
-                INSERT INTO indexing.GeneratedScripts (ServerName, DatabaseName, ScriptText, [Statistics], [Status])
+                INSERT INTO optimize.GeneratedScripts (ServerName, DatabaseName, ScriptText, [Statistics], [Status])
                 VALUES (@ServerName, @DatabaseLabel, NULL, 'No Recommendations', 'No Recommendations');
 
                 IF @Debug = 1 PRINT '  > Status saved to GeneratedScripts table (ScriptID: ' + CAST(SCOPE_IDENTITY() AS VARCHAR(10)) + ')';
@@ -6915,7 +6995,7 @@ BEGIN
             -- Save to table if requested
             IF @OutputToTable = 1
             BEGIN
-                INSERT INTO indexing.GeneratedScripts (ServerName, DatabaseName, ScriptText, [Statistics], [Status])
+                INSERT INTO optimize.GeneratedScripts (ServerName, DatabaseName, ScriptText, [Statistics], [Status])
                 VALUES (@ServerName, @DatabaseLabel, @ScriptText,
                     CONCAT('Databases: ', @DBCount, ', CREATE: ', @CreateCount, ', EXTEND: ', @ExtendCount, ', REBUILD: ', @RebuildCount, ', DROP: ', @DropCount, ', SUPERSET: ', @SupersetCount,
                         CASE WHEN @ActiveThreshold IS NOT NULL THEN
@@ -6957,15 +7037,15 @@ GO
 
 -- =============================================
 
-IF OBJECT_ID('indexing.sp_LoadDataFromServer', 'P') IS NOT NULL
-    DROP PROCEDURE indexing.sp_LoadDataFromServer;
+IF OBJECT_ID('optimize.sp_LoadDataFromServer', 'P') IS NOT NULL
+    DROP PROCEDURE optimize.sp_LoadDataFromServer;
 GO
 
-CREATE PROCEDURE indexing.sp_LoadDataFromServer
+CREATE PROCEDURE optimize.sp_LoadDataFromServer
     @ServerName NVARCHAR(128) = NULL,
     @MinIndexAdvantage DECIMAL(18,2) = 2500.0,
     @MinAvgUserImpact DECIMAL(18,2) = 99.0,
-    @DatabaseMode NVARCHAR(MAX) = NULL,  -- NULL = all user databases, or comma-delimited list
+    @Databases NVARCHAR(MAX) = NULL,  -- Ola-style: USER_DATABASES, %, exclusions with -, CSV
     @Debug BIT = 0
 AS
 BEGIN
@@ -6980,16 +7060,16 @@ BEGIN
         PRINT '  Server: ' + @ServerName;
         PRINT '  Min Index Advantage: ' + CAST(@MinIndexAdvantage AS VARCHAR(20));
         PRINT '  Min Average User Impact: ' + CAST(@MinAvgUserImpact AS VARCHAR(20));
-        IF @DatabaseMode IS NULL
-            PRINT '  Database Filter: All user databases (database_id > 4, ONLINE)';
+        IF @Databases IS NULL
+            PRINT '  Database Filter: USER_DATABASES (default)';
         ELSE
-            PRINT '  Database Filter: ' + @DatabaseMode;
+            PRINT '  Database Filter: ' + @Databases;
     END
 
     -- Clear existing data for this server
-    DELETE FROM indexing.IndexRecommendations WHERE ServerName = @ServerName;
-    DELETE FROM indexing.CurrentIndexes WHERE ServerName = @ServerName;
-    DELETE FROM indexing.ServerInfo WHERE ServerName = @ServerName;
+    DELETE FROM optimize.IndexRecommendations WHERE ServerName = @ServerName;
+    DELETE FROM optimize.CurrentIndexes WHERE ServerName = @ServerName;
+    DELETE FROM optimize.ServerInfo WHERE ServerName = @ServerName;
 
     IF @Debug = 1 PRINT 'Cleared existing data for ' + @ServerName;
 
@@ -6998,7 +7078,7 @@ BEGIN
     -- =============================================
     IF @Debug = 1 PRINT 'Loading server edition information...';
 
-    INSERT INTO indexing.ServerInfo (ServerName, Edition, IsEnterprise)
+    INSERT INTO optimize.ServerInfo (ServerName, Edition, IsEnterprise)
     SELECT
         @ServerName,
         CAST(SERVERPROPERTY('Edition') AS NVARCHAR(128)),
@@ -7081,37 +7161,14 @@ BEGIN
         Impact DECIMAL(18,2)
     );
 
-    -- Get list of databases based on @DatabaseMode parameter
+    -- Get list of databases
     DECLARE @DBName NVARCHAR(128);
     DECLARE @DBExecSQL NVARCHAR(MAX);
 
-    IF @DatabaseMode IS NULL
-    BEGIN
-        DECLARE db_cursor CURSOR FOR
-            SELECT d.name
-            FROM sys.databases d
-            WHERE d.state_desc = 'ONLINE'
-              AND d.database_id > 4
-            ORDER BY d.name;
-    END
-    ELSE IF @DatabaseMode LIKE '%[%]%'
-    BEGIN
-        DECLARE db_cursor CURSOR FOR
-            SELECT d.name
-            FROM sys.databases d
-            WHERE d.state_desc = 'ONLINE'
-              AND d.name LIKE @DatabaseMode
-            ORDER BY d.name;
-    END
-    ELSE
-    BEGIN
-        DECLARE db_cursor CURSOR FOR
-            SELECT d.name
-            FROM sys.databases d
-            INNER JOIN STRING_SPLIT(@DatabaseMode, ',') s ON d.name = LTRIM(RTRIM(s.value))
-            WHERE d.state_desc = 'ONLINE'
-            ORDER BY d.name;
-    END
+    DECLARE db_cursor CURSOR FOR
+        SELECT DatabaseName
+        FROM optimize.fn_GetDatabases(@Databases)
+        ORDER BY DatabaseName;
 
     OPEN db_cursor;
     FETCH NEXT FROM db_cursor INTO @DBName;
@@ -7138,7 +7195,7 @@ BEGIN
     DEALLOCATE db_cursor;
 
     -- Insert recommendations into permanent table
-    INSERT INTO indexing.IndexRecommendations (
+    INSERT INTO optimize.IndexRecommendations (
         ServerName, DatabaseName, IndexAdvantage, EstimatedQueryTime,
         SchemaTable, KeyColumns, IncludedColumns,
         UserSeeks, UserScans, PercentImprovement, AvgTotalUserCost, Impact
@@ -7168,7 +7225,7 @@ BEGIN
 
     INSERT INTO ##TablesToProcess (DatabaseName, SchemaTable)
     SELECT DISTINCT DatabaseName, SchemaTable
-    FROM indexing.IndexRecommendations
+    FROM optimize.IndexRecommendations
     WHERE ServerName = @ServerName;
 
     DECLARE @TableCount INT;
@@ -7311,7 +7368,7 @@ BEGIN
     DEALLOCATE db_cursor2;
 
     -- Insert into permanent table
-    INSERT INTO indexing.CurrentIndexes (
+    INSERT INTO optimize.CurrentIndexes (
         ServerName, DatabaseName, SchemaTable, IndexName,
         KeyColumns, IncludedColumns, IsDisabled, IsPrimaryKey, IsUnique, HasFilter, IndexSizeMB
     )
@@ -7330,7 +7387,7 @@ BEGIN
     BEGIN
         DECLARE @DBCount INT;
         SELECT @DBCount = COUNT(DISTINCT DatabaseName)
-        FROM indexing.IndexRecommendations
+        FROM optimize.IndexRecommendations
         WHERE ServerName = @ServerName;
 
         PRINT '';
@@ -7344,18 +7401,18 @@ BEGIN
 END
 GO
 
-PRINT 'Stored procedure indexing.sp_LoadDataFromServer created successfully (FIXED VERSION).';
+PRINT 'Stored procedure optimize.sp_LoadDataFromServer created successfully (FIXED VERSION).';
 GO
 
 GO
 
 -- =============================================
 
-IF OBJECT_ID('indexing.sp_LoadTestDataFromCSV', 'P') IS NOT NULL
-    DROP PROCEDURE indexing.sp_LoadTestDataFromCSV;
+IF OBJECT_ID('optimize.sp_LoadTestDataFromCSV', 'P') IS NOT NULL
+    DROP PROCEDURE optimize.sp_LoadTestDataFromCSV;
 GO
 
-CREATE PROCEDURE indexing.sp_LoadTestDataFromCSV
+CREATE PROCEDURE optimize.sp_LoadTestDataFromCSV
     @CSVPath NVARCHAR(500) = 'D:\sites\claude\optimize-index\Python\Dev\input\',
     @Debug BIT = 0
 AS
@@ -7383,9 +7440,9 @@ BEGIN
         END
 
         -- Clear existing data
-        TRUNCATE TABLE indexing.IndexRecommendations;
-        TRUNCATE TABLE indexing.CurrentIndexes;
-        TRUNCATE TABLE indexing.ServerInfo;
+        TRUNCATE TABLE optimize.IndexRecommendations;
+        TRUNCATE TABLE optimize.CurrentIndexes;
+        TRUNCATE TABLE optimize.ServerInfo;
 
         -- ============================================
         -- Load Recommendations using FORMAT CSV
@@ -7455,7 +7512,7 @@ BEGIN
         END
 
         -- Insert with type conversion, skipping rows with NULL required fields
-        INSERT INTO indexing.IndexRecommendations (
+        INSERT INTO optimize.IndexRecommendations (
             ServerName, DatabaseName, SchemaTable, KeyColumns, IncludedColumns,
             IndexAdvantage, Impact
         )
@@ -7538,7 +7595,7 @@ BEGIN
         IF @Debug = 1 PRINT '  > Loaded ' + CAST(@RowCount AS VARCHAR(10)) + ' rows into temp table';
 
         -- Insert with type conversion (using corrected column positions)
-        INSERT INTO indexing.CurrentIndexes (
+        INSERT INTO optimize.CurrentIndexes (
             ServerName, DatabaseName, SchemaTable, IndexName, KeyColumns, IncludedColumns,
             IndexSizeMB, IsDisabled, IsPrimaryKey, IsUnique, HasFilter
         )
@@ -7611,7 +7668,7 @@ BEGIN
         IF @Debug = 1 PRINT '  > Loaded ' + CAST(@RowCount AS VARCHAR(10)) + ' rows into temp table';
 
         -- Insert server info
-        INSERT INTO indexing.ServerInfo (ServerName, Edition)
+        INSERT INTO optimize.ServerInfo (ServerName, Edition)
         SELECT
             Col1,  -- ServerName
             Col2   -- Edition
@@ -7653,11 +7710,11 @@ GO
 USE DBA_Utilities;
 GO
 
-IF OBJECT_ID('indexing.sp_ExportGeneratedScript', 'P') IS NOT NULL
-    DROP PROCEDURE indexing.sp_ExportGeneratedScript;
+IF OBJECT_ID('optimize.sp_ExportGeneratedScript', 'P') IS NOT NULL
+    DROP PROCEDURE optimize.sp_ExportGeneratedScript;
 GO
 
-CREATE PROCEDURE indexing.sp_ExportGeneratedScript
+CREATE PROCEDURE optimize.sp_ExportGeneratedScript
     @ServerName NVARCHAR(128) = NULL,  -- Get latest script for this server
     @ScriptID INT = NULL,              -- Get specific script by ID
     @OutputPath NVARCHAR(500) = NULL   -- Optional: specify output file path
@@ -7676,8 +7733,8 @@ BEGIN
     BEGIN
         PRINT 'ERROR: Must specify either @ServerName or @ScriptID';
         PRINT 'Usage:';
-        PRINT '  EXEC indexing.sp_ExportGeneratedScript @ServerName=''USW2-018-SQL''';
-        PRINT '  EXEC indexing.sp_ExportGeneratedScript @ScriptID=1';
+        PRINT '  EXEC optimize.sp_ExportGeneratedScript @ServerName=''USW2-018-SQL''';
+        PRINT '  EXEC optimize.sp_ExportGeneratedScript @ScriptID=1';
         RETURN;
     END
 
@@ -7696,7 +7753,7 @@ BEGIN
             @ActualServerName = ServerName,
             @Script = ScriptText,
             @GeneratedDate = GeneratedDate
-        FROM indexing.GeneratedScripts
+        FROM optimize.GeneratedScripts
         WHERE ScriptID = @ScriptID;
 
         IF @Script IS NULL
@@ -7713,7 +7770,7 @@ BEGIN
             @ActualServerName = ServerName,
             @Script = ScriptText,
             @GeneratedDate = GeneratedDate
-        FROM indexing.GeneratedScripts
+        FROM optimize.GeneratedScripts
         WHERE ServerName = @ServerName
         ORDER BY ScriptID DESC;
 
@@ -7740,18 +7797,18 @@ BEGIN
             PRINT 'This script is too large for reliable console viewing.';
             PRINT '';
             PRINT 'RECOMMENDED SOLUTION 1: Export to file';
-            PRINT '  EXEC indexing.sp_ExportGeneratedScript';
+            PRINT '  EXEC optimize.sp_ExportGeneratedScript';
             PRINT '      @ServerName=''' + @ActualServerName + ''',';
             PRINT '      @OutputPath=''C:\temp\' + @ActualServerName + '_script.sql'';';
             PRINT '';
             PRINT 'RECOMMENDED SOLUTION 2: Direct query in SSMS';
             PRINT '  1. Press Ctrl+Shift+F (Results to File)';
             PRINT '  2. Run this query:';
-            PRINT '     SELECT ScriptText FROM indexing.GeneratedScripts WHERE ScriptID=' + CAST(@ActualScriptID AS VARCHAR(10)) + ';';
+            PRINT '     SELECT ScriptText FROM optimize.GeneratedScripts WHERE ScriptID=' + CAST(@ActualScriptID AS VARCHAR(10)) + ';';
             PRINT '  3. Choose save location';
             PRINT '';
             PRINT 'SOLUTION 3: Copy from grid (may lose formatting)';
-            PRINT '  SELECT ScriptText FROM indexing.GeneratedScripts WHERE ScriptID=' + CAST(@ActualScriptID AS VARCHAR(10)) + ';';
+            PRINT '  SELECT ScriptText FROM optimize.GeneratedScripts WHERE ScriptID=' + CAST(@ActualScriptID AS VARCHAR(10)) + ';';
             PRINT '';
             PRINT '============================================';
             PRINT '*/';
@@ -7780,7 +7837,7 @@ BEGIN
     ELSE
     BEGIN
         -- Export to file using BCP
-        SET @Command = 'bcp "SELECT ScriptText FROM DBA_Utilities.indexing.GeneratedScripts WHERE ScriptID = ' + CAST(@ActualScriptID AS VARCHAR(10)) + '" queryout "' + @OutputPath + '" -c -T -S ' + @@SERVERNAME;
+        SET @Command = 'bcp "SELECT ScriptText FROM DBA_Utilities.optimize.GeneratedScripts WHERE ScriptID = ' + CAST(@ActualScriptID AS VARCHAR(10)) + '" queryout "' + @OutputPath + '" -c -T -S ' + @@SERVERNAME;
 
         PRINT 'Exporting script to: ' + @OutputPath;
         PRINT 'ScriptID: ' + CAST(@ActualScriptID AS VARCHAR(10)) + ' | Server: ' + @ActualServerName + ' | Generated: ' + CONVERT(VARCHAR(20), @GeneratedDate, 120);
@@ -7794,29 +7851,29 @@ PRINT 'Stored procedure sp_ExportGeneratedScript created successfully.';
 PRINT '';
 PRINT 'Usage Examples:';
 PRINT '  -- Get latest script for a server:';
-PRINT '  EXEC indexing.sp_ExportGeneratedScript @ServerName=''USW2-018-SQL''';
+PRINT '  EXEC optimize.sp_ExportGeneratedScript @ServerName=''USW2-018-SQL''';
 PRINT '';
 PRINT '  -- Get specific script by ID:';
-PRINT '  EXEC indexing.sp_ExportGeneratedScript @ScriptID=1';
+PRINT '  EXEC optimize.sp_ExportGeneratedScript @ScriptID=1';
 PRINT '';
 PRINT '  -- Export to file:';
-PRINT '  EXEC indexing.sp_ExportGeneratedScript @ServerName=''USW2-018-SQL'', @OutputPath=''C:\temp\script.sql''';
+PRINT '  EXEC optimize.sp_ExportGeneratedScript @ServerName=''USW2-018-SQL'', @OutputPath=''C:\temp\script.sql''';
 PRINT '';
 PRINT '  -- List all available scripts:';
-PRINT '  SELECT ScriptID, ServerName, GeneratedDate, LEN(ScriptText) AS [Length] FROM indexing.GeneratedScripts ORDER BY ScriptID DESC;';
+PRINT '  SELECT ScriptID, ServerName, GeneratedDate, LEN(ScriptText) AS [Length] FROM optimize.GeneratedScripts ORDER BY ScriptID DESC;';
 GO
 
 GO
 
 -- =============================================
 
-IF OBJECT_ID('indexing.sp_CreateIndexOptimizationRecommendations', 'P') IS NOT NULL
-    DROP PROCEDURE indexing.sp_CreateIndexOptimizationRecommendations;
+IF OBJECT_ID('optimize.sp_CreateIndexOptimizationRecommendations', 'P') IS NOT NULL
+    DROP PROCEDURE optimize.sp_CreateIndexOptimizationRecommendations;
 GO
 
-CREATE PROCEDURE indexing.sp_CreateIndexOptimizationRecommendations
+CREATE PROCEDURE optimize.sp_CreateIndexOptimizationRecommendations
     @ServerName NVARCHAR(128) = NULL,
-    @DatabaseName NVARCHAR(MAX) = NULL,  -- NULL = all user databases, or comma-delimited list
+    @Databases NVARCHAR(MAX) = NULL,  -- Ola-style: USER_DATABASES, %, exclusions with -, CSV
     @MinIndexAdvantage DECIMAL(18,2) = 2500.0,
     @MinAvgUserImpact DECIMAL(18,2) = 99.0,
     @RunnableUnder VARCHAR(20) = NULL,  -- NULL=all uncommented, '2'=2GB both, '1,5e'=1GB Std/5GB Ent
@@ -7840,7 +7897,7 @@ BEGIN
             PRINT 'One-Command Workflow'
             PRINT '=============================================='
             PRINT 'Server: ' + @ServerName
-            PRINT 'Database: ' + ISNULL(@DatabaseName, 'All user databases')
+            PRINT 'Database: ' + ISNULL(@Databases, 'USER_DATABASES')
             PRINT 'Min Index Advantage: ' + CAST(@MinIndexAdvantage AS VARCHAR(20))
             PRINT 'Min Avg User Impact: ' + CAST(@MinAvgUserImpact AS VARCHAR(20))
             IF @RunnableUnder IS NOT NULL
@@ -7852,27 +7909,27 @@ BEGIN
         -- Step 1: Load data from SQL Server DMVs
         IF @Debug = 1 PRINT 'Step 1/3: Loading data from SQL Server DMVs...'
 
-        EXEC indexing.sp_LoadDataFromServer
+        EXEC optimize.sp_LoadDataFromServer
             @ServerName = @ServerName,
             @MinIndexAdvantage = @MinIndexAdvantage,
             @MinAvgUserImpact = @MinAvgUserImpact,
-            @DatabaseMode = @DatabaseName,  -- Pass database mode directly
+            @Databases = @Databases,
             @Debug = @Debug;
 
         -- Step 2: Analyze and consolidate recommendations
         IF @Debug = 1 PRINT ''
         IF @Debug = 1 PRINT 'Step 2/3: Analyzing recommendations and determining strategies...'
 
-        EXEC indexing.sp_AnalyzeIndexStrategies
+        EXEC optimize.sp_AnalyzeIndexStrategies
             @Debug = @Debug;
 
         -- Step 3: Generate optimization script
         IF @Debug = 1 PRINT ''
         IF @Debug = 1 PRINT 'Step 3/3: Generating optimization script...'
 
-        EXEC indexing.sp_GenerateOptimizationScript
+        EXEC optimize.sp_GenerateOptimizationScript
             @ServerName = @ServerName,
-            @DatabaseName = @DatabaseName,
+            @Databases = @Databases,
             @RunnableUnder = @RunnableUnder,
             @Debug = @Debug;
 
@@ -7896,7 +7953,7 @@ BEGIN
             [Statistics],
             [Status],
             ScriptText
-        FROM indexing.GeneratedScripts
+        FROM optimize.GeneratedScripts
         WHERE ServerName = @ServerName
         ORDER BY ScriptID DESC;
 
@@ -7913,7 +7970,7 @@ BEGIN
 END
 GO
 
-PRINT 'Stored procedure indexing.sp_CreateIndexOptimizationRecommendations created successfully.'
+PRINT 'Stored procedure optimize.sp_CreateIndexOptimizationRecommendations created successfully.'
 GO
 
 GO
@@ -7941,11 +7998,11 @@ GO
 -- Version: 2.0
 -- =============================================
 
-IF OBJECT_ID('indexing.sp_CalculateIndexSizeEstimate', 'P') IS NOT NULL
-    DROP PROCEDURE indexing.sp_CalculateIndexSizeEstimate;
+IF OBJECT_ID('optimize.sp_CalculateIndexSizeEstimate', 'P') IS NOT NULL
+    DROP PROCEDURE optimize.sp_CalculateIndexSizeEstimate;
 GO
 
-CREATE PROCEDURE indexing.sp_CalculateIndexSizeEstimate
+CREATE PROCEDURE optimize.sp_CalculateIndexSizeEstimate
     @DatabaseName NVARCHAR(128),
     @SchemaTable NVARCHAR(256),           -- Format: [schema].[table]
     @KeyColumns NVARCHAR(MAX),            -- Format: [col1], [col2], [col3]
@@ -8239,7 +8296,7 @@ GO
 DECLARE @SizeGB DECIMAL(18,2);
 DECLARE @Breakdown NVARCHAR(MAX);
 
-EXEC indexing.sp_CalculateIndexSizeEstimate
+EXEC optimize.sp_CalculateIndexSizeEstimate
     @DatabaseName = 'mc_npp_7779',
     @SchemaTable = '[dbo].[audit_trail_columns_changed]',
     @KeyColumns = '[table_name], [column_name_key]',
@@ -8271,11 +8328,11 @@ PRINT @Breakdown;
 -- Version: 1.0
 -- =============================================
 
-IF OBJECT_ID('indexing.sp_GetHybridIndexSizeEstimate', 'P') IS NOT NULL
-    DROP PROCEDURE indexing.sp_GetHybridIndexSizeEstimate;
+IF OBJECT_ID('optimize.sp_GetHybridIndexSizeEstimate', 'P') IS NOT NULL
+    DROP PROCEDURE optimize.sp_GetHybridIndexSizeEstimate;
 GO
 
-CREATE PROCEDURE indexing.sp_GetHybridIndexSizeEstimate
+CREATE PROCEDURE optimize.sp_GetHybridIndexSizeEstimate
     @DatabaseName NVARCHAR(128),
     @SchemaTable NVARCHAR(256),
     @RecKeyColumns NVARCHAR(MAX),
@@ -8301,7 +8358,7 @@ BEGIN
     IF @Debug = 1
         PRINT '--- Trying Smart Estimator (similarity-based) ---';
 
-    EXEC indexing.sp_GetSmartTableSizeEstimate
+    EXEC optimize.sp_GetSmartTableSizeEstimate
         @DatabaseName = @DatabaseName,
         @SchemaTable = @SchemaTable,
         @RecKeyColumns = @RecKeyColumns,
@@ -8334,7 +8391,7 @@ BEGIN
     DECLARE @CalcSizeGB DECIMAL(18,2);
     DECLARE @CalcBreakdown NVARCHAR(MAX);
 
-    EXEC indexing.sp_CalculateIndexSizeEstimate
+    EXEC optimize.sp_CalculateIndexSizeEstimate
         @DatabaseName = @DatabaseName,
         @SchemaTable = @SchemaTable,
         @KeyColumns = @RecKeyColumns,
@@ -8382,7 +8439,7 @@ GO
 
 -- Test 1: Table WITH similar indexes (should use Smart)
 DECLARE @Warning NVARCHAR(MAX);
-EXEC indexing.sp_GetHybridIndexSizeEstimate
+EXEC optimize.sp_GetHybridIndexSizeEstimate
     @DatabaseName = 'mc_thermofisher_1819_dev',
     @SchemaTable = '[dbo].[audit_trail_columns_changed]',
     @RecKeyColumns = '[trans_id]',
@@ -8396,7 +8453,7 @@ PRINT '=====================================';
 PRINT '';
 
 -- Test 2: Table WITHOUT similar indexes (should use Calculation)
-EXEC indexing.sp_GetHybridIndexSizeEstimate
+EXEC optimize.sp_GetHybridIndexSizeEstimate
     @DatabaseName = 'mc_thermofisher_1819_dev',
     @SchemaTable = '[dbo].[some_empty_table]',
     @RecKeyColumns = '[some_key]',
@@ -8410,7 +8467,7 @@ PRINT '=====================================';
 PRINT '';
 
 -- Test 3: Small index (should return NULL)
-EXEC indexing.sp_GetHybridIndexSizeEstimate
+EXEC optimize.sp_GetHybridIndexSizeEstimate
     @DatabaseName = 'mc_small_db',
     @SchemaTable = '[dbo].[small_table]',
     @RecKeyColumns = '[id]',
@@ -8426,8 +8483,8 @@ SELECT @Warning AS Warning;
 -- Missing Index Recommendations (per-finding view)
 -- =============================================
 
-CREATE OR ALTER PROCEDURE indexing.sp_MissingIndexRecommendations
-  @DatabaseName      NVARCHAR(MAX)  = NULL
+CREATE OR ALTER PROCEDURE optimize.sp_MissingIndexRecommendations
+  @Databases         NVARCHAR(MAX)  = NULL  -- Ola-style: USER_DATABASES, %, exclusions with -, CSV
  ,@TableName         NVARCHAR(128)  = NULL
  ,@RunnableUnder     VARCHAR(20)    = NULL  -- NULL=all uncommented, '2'=2GB both, '1,5e'=1GB Std/5GB Ent
  ,@RunAnalysis       BIT            = 0
@@ -8439,17 +8496,17 @@ BEGIN
 
   IF @RunAnalysis = 1
   BEGIN
-    EXEC indexing.sp_LoadDataFromServer
+    EXEC optimize.sp_LoadDataFromServer
         @ServerName        = @@SERVERNAME,
-        @DatabaseMode      = @DatabaseName,
+        @Databases         = @Databases,
         @MinIndexAdvantage = @MinIndexAdvantage,
         @MinAvgUserImpact  = @MinAvgUserImpact;
 
-    EXEC indexing.sp_AnalyzeIndexStrategies;
+    EXEC optimize.sp_AnalyzeIndexStrategies;
 
-    EXEC indexing.sp_GenerateOptimizationScript
+    EXEC optimize.sp_GenerateOptimizationScript
         @ServerName    = @@SERVERNAME,
-        @DatabaseName  = @DatabaseName,
+        @Databases     = @Databases,
         @RunnableUnder = @RunnableUnder;
   END
 
@@ -8497,13 +8554,11 @@ BEGIN
         ,@TotalCreate     = SUM(CASE WHEN Strategy IN ('CREATE', 'CREATE_CONSOLIDATED', 'CREATE_SUPER_CONSOLIDATED', 'PREFIX_MATCH') THEN 1 ELSE 0 END)
         ,@TotalExtend     = SUM(CASE WHEN Strategy IN ('EXTEND', 'UPDATE', 'EXTEND_DISABLED') THEN 1 ELSE 0 END)
         ,@TotalRebuild    = SUM(CASE WHEN Strategy = 'REBUILD' THEN 1 ELSE 0 END)
-  FROM indexing.MissingIndexResults
+  FROM optimize.MissingIndexResults
   WHERE ResolvedDate IS NULL
     AND Strategy NOT IN ('SUPERSET_COVERED')
     AND ServerName = @@SERVERNAME
-    AND (@DatabaseName IS NULL
-              OR (@DatabaseName LIKE '%[%]%' AND DatabaseName LIKE @DatabaseName)
-              OR (@DatabaseName NOT LIKE '%[%]%' AND DatabaseName IN (SELECT LTRIM(RTRIM(value)) FROM STRING_SPLIT(@DatabaseName, ','))))
+    AND DatabaseName IN (SELECT DatabaseName FROM optimize.fn_GetDatabases(@Databases))
     AND (@TableName IS NULL OR TableName = @TableName)
     AND EXISTS (SELECT 1 FROM sys.databases WHERE name = DatabaseName);
 
@@ -8523,7 +8578,7 @@ BEGIN
     + '      Rebuild:         ' + FORMAT(@TotalRebuild, 'N0') + @CRLF
     + @CRLF
     + 'Filters:' + @CRLF
-    + '    @DatabaseName   = ' + ISNULL('''' + @DatabaseName + '''', 'ALL') + @CRLF
+    + '    @Databases      = ' + ISNULL('''' + @Databases + '''', 'USER_DATABASES (default)') + @CRLF
     + '    @TableName      = ' + ISNULL('''' + @TableName + '''', 'ALL') + @CRLF
     + '    @RunnableUnder  = ' + ISNULL('''' + @RunnableUnder + '''', 'NULL (all uncommented)') + @CRLF
     + '*/' + @CRLF;
@@ -8567,13 +8622,11 @@ BEGIN
            KeyColumns, IncludedColumns, IndexAdvantage, RecommendationCount,
            RecommendationIDs, EstimatedSizeGB, CreateStatement,
            IsSuperConsolidated, OriginalGroupCount
-    FROM indexing.MissingIndexResults
+    FROM optimize.MissingIndexResults
     WHERE ResolvedDate IS NULL
       AND Strategy NOT IN ('SUPERSET_COVERED')
       AND ServerName = @@SERVERNAME
-      AND (@DatabaseName IS NULL
-                OR (@DatabaseName LIKE '%[%]%' AND DatabaseName LIKE @DatabaseName)
-                OR (@DatabaseName NOT LIKE '%[%]%' AND DatabaseName IN (SELECT LTRIM(RTRIM(value)) FROM STRING_SPLIT(@DatabaseName, ','))))
+      AND DatabaseName IN (SELECT DatabaseName FROM optimize.fn_GetDatabases(@Databases))
       AND (@TableName IS NULL OR TableName = @TableName)
       AND EXISTS (SELECT 1 FROM sys.databases WHERE name = DatabaseName)
     ORDER BY DatabaseName, SchemaName, TableName, IndexAdvantage DESC;
@@ -8674,11 +8727,11 @@ BEGIN
     -- UPDATE ResolvedDate: commented out if finding exceeds threshold
     IF @ShouldComment = 1
       SET @ScriptText = @ScriptText
-        + @CRLF + '/* UPDATE DBA_Utilities.indexing.MissingIndexResults SET ResolvedDate = GETDATE() WHERE MissingIndexId = ' + CAST(@Id AS VARCHAR(10)) + '; */' + @CRLF;
+        + @CRLF + '/* UPDATE DBA_Utilities.optimize.MissingIndexResults SET ResolvedDate = GETDATE() WHERE MissingIndexId = ' + CAST(@Id AS VARCHAR(10)) + '; */' + @CRLF;
     ELSE
     BEGIN
       SET @ScriptText = @ScriptText
-        + @CRLF + 'UPDATE DBA_Utilities.indexing.MissingIndexResults SET ResolvedDate = GETDATE() WHERE MissingIndexId = ' + CAST(@Id AS VARCHAR(10)) + ';' + @CRLF;
+        + @CRLF + 'UPDATE DBA_Utilities.optimize.MissingIndexResults SET ResolvedDate = GETDATE() WHERE MissingIndexId = ' + CAST(@Id AS VARCHAR(10)) + ';' + @CRLF;
       SET @RunnableCount = @RunnableCount + 1;
     END
 
@@ -8693,7 +8746,7 @@ BEGIN
   DEALLOCATE rec_cursor;
 
   SELECT @@SERVERNAME                                AS ServerName
-        ,ISNULL(@DatabaseName, 'ALL')                AS DatabaseName
+        ,ISNULL(@Databases, 'ALL')                    AS DatabaseName
         ,GETDATE()                                   AS GeneratedDate
         ,FORMAT(@TotalRecs, 'N0') + ' recommendations ('
          + FORMAT(@TotalCreate, 'N0') + ' create, '
@@ -8719,12 +8772,22 @@ GO
 -- EXPENSIVE QUERY PLAN ANALYSIS
 -- ==========================================================================
 
+/*
+    SQL Server Optimization Suite
+    Default Database: DBA_Utilities
+
+    To install in a different database, find and replace all instances of
+    "DBA_Utilities" with your database name before running this script.
+*/
+USE DBA_Utilities;
+GO
+
 -- =========================================================================
--- Table: indexing.ExpensiveQueryResults
+-- Table: optimize.ExpensiveQueryResults
 -- =========================================================================
-IF OBJECT_ID('indexing.ExpensiveQueryResults', 'U') IS NULL
+IF OBJECT_ID('optimize.ExpensiveQueryResults', 'U') IS NULL
 BEGIN
-  CREATE TABLE indexing.ExpensiveQueryResults
+  CREATE TABLE optimize.ExpensiveQueryResults
     (ExpensiveQueryId     INT            IDENTITY(1, 1)
     ,ServerName           NVARCHAR(128)  NOT NULL
     ,DatabaseName         NVARCHAR(128)  NOT NULL
@@ -8760,10 +8823,10 @@ END
 GO
 
 -- =========================================================================
--- Proc: indexing.sp_ExpensiveQueryAnalysis
+-- Proc: optimize.sp_ExpensiveQueryAnalysis
 -- =========================================================================
-CREATE OR ALTER PROCEDURE indexing.sp_ExpensiveQueryAnalysis
-  @DatabaseName     NVARCHAR(MAX) = NULL
+CREATE OR ALTER PROCEDURE optimize.sp_ExpensiveQueryAnalysis
+  @Databases        NVARCHAR(MAX) = NULL
  ,@TopN             INT           = 50
  ,@SortBy           VARCHAR(20)   = 'READS'
  ,@MinExecutions    BIGINT        = 10
@@ -8774,35 +8837,14 @@ AS
 BEGIN
   SET NOCOUNT ON;
 
-  DELETE FROM indexing.ExpensiveQueryResults WHERE ResolvedDate IS NULL;
+  DELETE FROM optimize.ExpensiveQueryResults WHERE ResolvedDate IS NULL;
 
   DROP TABLE IF EXISTS #DBs;
   CREATE TABLE #DBs (DatabaseName NVARCHAR(128), rn INT);
 
-  IF @DatabaseName IS NULL
-  BEGIN
-    INSERT INTO #DBs (DatabaseName, rn)
-    SELECT d.name, ROW_NUMBER() OVER (ORDER BY d.name)
-    FROM sys.databases d
-    WHERE d.state_desc = 'ONLINE'
-      AND d.database_id > 4;
-  END
-  ELSE IF @DatabaseName LIKE '%[%]%'
-  BEGIN
-    INSERT INTO #DBs (DatabaseName, rn)
-    SELECT d.name, ROW_NUMBER() OVER (ORDER BY d.name)
-    FROM sys.databases d
-    WHERE d.state_desc = 'ONLINE'
-      AND d.name LIKE @DatabaseName;
-  END
-  ELSE
-  BEGIN
-    INSERT INTO #DBs (DatabaseName, rn)
-    SELECT d.name, ROW_NUMBER() OVER (ORDER BY d.name)
-    FROM sys.databases d
-    INNER JOIN STRING_SPLIT(@DatabaseName, ',') s ON d.name = LTRIM(RTRIM(s.value))
-    WHERE d.state_desc = 'ONLINE';
-  END;
+  INSERT INTO #DBs (DatabaseName, rn)
+  SELECT DatabaseName, ROW_NUMBER() OVER (ORDER BY DatabaseName)
+  FROM optimize.fn_GetDatabases(@Databases);
 
   -- =========================================================================
   -- Phase 1: Plan Cache analysis (always runs)
@@ -8839,7 +8881,7 @@ BEGIN
 
   -- 1B: Extract scans from top query plans
   ;WITH XMLNAMESPACES (DEFAULT N'http://schemas.microsoft.com/sqlserver/2004/07/showplan')
-  INSERT INTO indexing.ExpensiveQueryResults
+  INSERT INTO optimize.ExpensiveQueryResults
     (ServerName, DatabaseName, FindingType, SchemaName, TableName, IndexName
     ,QueryHash, TotalExecutions, TotalLogicalReads, TotalCPUTimeMs, TotalDurationMs
     ,AvgLogicalReads, AvgCPUTimeMs, AvgDurationMs
@@ -8890,7 +8932,7 @@ BEGIN
 
   -- 1C: Extract missing index hints from top query plans
   ;WITH XMLNAMESPACES (DEFAULT N'http://schemas.microsoft.com/sqlserver/2004/07/showplan')
-  INSERT INTO indexing.ExpensiveQueryResults
+  INSERT INTO optimize.ExpensiveQueryResults
     (ServerName, DatabaseName, FindingType, SchemaName, TableName
     ,QueryHash, TotalExecutions, TotalLogicalReads, TotalCPUTimeMs, TotalDurationMs
     ,AvgLogicalReads, AvgCPUTimeMs, AvgDurationMs
@@ -8943,17 +8985,17 @@ BEGIN
     AND mi.node.value('(MissingIndexGroup/@Impact)[1]', 'FLOAT') >= @MinImpact;
 
   -- Filter results to target databases only
-  DELETE FROM indexing.ExpensiveQueryResults
+  DELETE FROM optimize.ExpensiveQueryResults
   WHERE ResolvedDate IS NULL
     AND DatabaseName NOT IN (SELECT DatabaseName FROM #DBs);
 
   -- Remove findings that match already-resolved recommendations
   DELETE nr
-  FROM indexing.ExpensiveQueryResults nr
+  FROM optimize.ExpensiveQueryResults nr
   WHERE nr.ResolvedDate IS NULL
     AND nr.FindingType = 'MISSING_INDEX'
     AND EXISTS (
-        SELECT 1 FROM indexing.ExpensiveQueryResults res
+        SELECT 1 FROM optimize.ExpensiveQueryResults res
         WHERE res.ResolvedDate IS NOT NULL
           AND res.FindingType = 'MISSING_INDEX'
           AND res.DatabaseName = nr.DatabaseName
@@ -8970,7 +9012,7 @@ BEGIN
                  PARTITION BY DatabaseName, SchemaName, TableName, MissingIndexKeys, MissingIndexIncludes
                  ORDER BY TotalLogicalReads DESC
              ) AS rn
-      FROM indexing.ExpensiveQueryResults
+      FROM optimize.ExpensiveQueryResults
       WHERE ResolvedDate IS NULL AND FindingType = 'MISSING_INDEX'
   )
   DELETE FROM Dupes WHERE rn > 1;
@@ -8986,17 +9028,17 @@ BEGIN
              COUNT(*) OVER (
                  PARTITION BY DatabaseName, SchemaName, TableName, MissingIndexKeys
              ) AS grp_count
-      FROM indexing.ExpensiveQueryResults
+      FROM optimize.ExpensiveQueryResults
       WHERE ResolvedDate IS NULL AND FindingType = 'MISSING_INDEX'
   )
   UPDATE keeper
   SET MissingIndexIncludes = merged.val
-  FROM indexing.ExpensiveQueryResults keeper
+  FROM optimize.ExpensiveQueryResults keeper
   INNER JOIN KeyGroups kg ON keeper.ExpensiveQueryId = kg.ExpensiveQueryId AND kg.rn = 1 AND kg.grp_count > 1
   CROSS APPLY (
       SELECT STUFF((
           SELECT DISTINCT ', ' + LTRIM(RTRIM(s.value))
-          FROM indexing.ExpensiveQueryResults e2
+          FROM optimize.ExpensiveQueryResults e2
           INNER JOIN KeyGroups kg2 ON e2.ExpensiveQueryId = kg2.ExpensiveQueryId
               AND kg2.DatabaseName = kg.DatabaseName AND kg2.SchemaName = kg.SchemaName
               AND kg2.TableName = kg.TableName AND kg2.MissingIndexKeys = kg.MissingIndexKeys
@@ -9013,7 +9055,7 @@ BEGIN
                  PARTITION BY DatabaseName, SchemaName, TableName, MissingIndexKeys
                  ORDER BY TotalLogicalReads DESC
              ) AS rn
-      FROM indexing.ExpensiveQueryResults
+      FROM optimize.ExpensiveQueryResults
       WHERE ResolvedDate IS NULL AND FindingType = 'MISSING_INDEX'
   )
   DELETE FROM KeyGroups WHERE rn > 1;
@@ -9023,11 +9065,11 @@ BEGIN
   WHILE @prefixDone = 0
   BEGIN
       DELETE narrow
-      FROM indexing.ExpensiveQueryResults narrow
+      FROM optimize.ExpensiveQueryResults narrow
       WHERE narrow.ResolvedDate IS NULL
         AND narrow.FindingType = 'MISSING_INDEX'
         AND EXISTS (
-            SELECT 1 FROM indexing.ExpensiveQueryResults wide
+            SELECT 1 FROM optimize.ExpensiveQueryResults wide
             WHERE wide.ResolvedDate IS NULL
               AND wide.FindingType = 'MISSING_INDEX'
               AND wide.DatabaseName = narrow.DatabaseName
@@ -9119,7 +9161,7 @@ BEGIN
         ) historical
         WHERE CAST(recent.avg_logical_reads AS FLOAT) / NULLIF(historical.avg_logical_reads, 0) >= 3;
 
-        INSERT INTO DBA_Utilities.indexing.ExpensiveQueryResults
+        INSERT INTO DBA_Utilities.optimize.ExpensiveQueryResults
           (ServerName, DatabaseName, FindingType
           ,QueryHash, TotalExecutions, TotalLogicalReads
           ,AvgLogicalReads, AvgCPUTimeMs, AvgDurationMs
@@ -9171,7 +9213,7 @@ BEGIN
   DECLARE enrich_cursor CURSOR LOCAL FAST_FORWARD FOR
       SELECT ExpensiveQueryId, DatabaseName, SchemaName, TableName,
              MissingIndexKeys, MissingIndexIncludes
-      FROM indexing.ExpensiveQueryResults
+      FROM optimize.ExpensiveQueryResults
       WHERE ResolvedDate IS NULL AND FindingType = 'MISSING_INDEX';
 
   OPEN enrich_cursor;
@@ -9179,7 +9221,7 @@ BEGIN
 
   WHILE @@FETCH_STATUS = 0
   BEGIN
-      EXEC indexing.sp_BuildIndexScript
+      EXEC optimize.sp_BuildIndexScript
           @DatabaseName   = @eDB,
           @SchemaName     = @eSchema,
           @TableName      = @eTable,
@@ -9191,7 +9233,7 @@ BEGIN
 
       IF @oStrategy IN ('INVALID_COLUMNS', 'SUPERSET_COVERED')
       BEGIN
-          UPDATE indexing.ExpensiveQueryResults
+          UPDATE optimize.ExpensiveQueryResults
           SET CreateStatement = NULL,
               Recommendation  = @oRec,
               ResolvedDate    = GETDATE()
@@ -9205,7 +9247,7 @@ BEGIN
           SET @eSchemaTable = QUOTENAME(@eSchema) + '.' + QUOTENAME(@eTable);
 
           BEGIN TRY
-              EXEC indexing.sp_GetHybridIndexSizeEstimate
+              EXEC optimize.sp_GetHybridIndexSizeEstimate
                   @DatabaseName      = @eDB,
                   @SchemaTable       = @eSchemaTable,
                   @RecKeyColumns     = @eKeys,
@@ -9224,7 +9266,7 @@ BEGIN
               SET @eEstGB = NULL;
           END CATCH
 
-          UPDATE indexing.ExpensiveQueryResults
+          UPDATE optimize.ExpensiveQueryResults
           SET CreateStatement = @oScript,
               Recommendation  = @oRec,
               EstimatedSizeGB = @eEstGB
@@ -9242,10 +9284,10 @@ END;
 GO
 
 -- =========================================================================
--- Proc: indexing.sp_ExpensiveQueryRecommendations
+-- Proc: optimize.sp_ExpensiveQueryRecommendations
 -- =========================================================================
-CREATE OR ALTER PROCEDURE indexing.sp_ExpensiveQueryRecommendations
-  @DatabaseName     NVARCHAR(MAX) = NULL
+CREATE OR ALTER PROCEDURE optimize.sp_ExpensiveQueryRecommendations
+  @Databases        NVARCHAR(MAX) = NULL
  ,@TableName        NVARCHAR(128) = NULL
  ,@RunAnalysis      BIT           = 0
  ,@TopN             INT           = 50
@@ -9288,8 +9330,8 @@ BEGIN
   SET @ActiveThreshold = CASE WHEN @IsEnterprise = 1 THEN @ThresholdEnt ELSE @ThresholdStd END;
 
   IF @RunAnalysis = 1
-    EXEC indexing.sp_ExpensiveQueryAnalysis
-        @DatabaseName   = @DatabaseName
+    EXEC optimize.sp_ExpensiveQueryAnalysis
+        @Databases      = @Databases
        ,@TopN           = @TopN
        ,@SortBy         = @SortBy
        ,@MinExecutions  = @MinExecutions
@@ -9312,11 +9354,9 @@ BEGIN
         ,@TotalScans       = SUM(CASE WHEN FindingType = 'TABLE_SCAN' THEN 1 ELSE 0 END)
         ,@TotalMissing     = SUM(CASE WHEN FindingType = 'MISSING_INDEX' THEN 1 ELSE 0 END)
         ,@TotalRegressed   = SUM(CASE WHEN FindingType = 'REGRESSED_QUERY' THEN 1 ELSE 0 END)
-  FROM indexing.ExpensiveQueryResults
+  FROM optimize.ExpensiveQueryResults
   WHERE ResolvedDate IS NULL
-    AND (@DatabaseName IS NULL
-              OR (@DatabaseName LIKE '%[%]%' AND DatabaseName LIKE @DatabaseName)
-              OR (@DatabaseName NOT LIKE '%[%]%' AND DatabaseName IN (SELECT LTRIM(RTRIM(value)) FROM STRING_SPLIT(@DatabaseName, ','))))
+    AND DatabaseName IN (SELECT DatabaseName FROM optimize.fn_GetDatabases(@Databases))
     AND (@TableName    IS NULL OR TableName    = @TableName)
     AND (@FindingType  IS NULL OR FindingType  = @FindingType)
     AND EXISTS (SELECT 1 FROM sys.databases WHERE name = DatabaseName);
@@ -9336,7 +9376,7 @@ BEGIN
     + '      Regressed Queries:' + CAST(@TotalRegressed AS VARCHAR(10)) + @CRLF
     + @CRLF
     + 'Filters:' + @CRLF
-    + '    @DatabaseName   = ' + ISNULL('''' + @DatabaseName + '''', 'ALL') + @CRLF
+    + '    @Databases      = ' + ISNULL('''' + @Databases + '''', 'ALL') + @CRLF
     + '    @TableName      = ' + ISNULL('''' + @TableName + '''', 'ALL') + @CRLF
     + '    @FindingType    = ' + ISNULL('''' + @FindingType + '''', 'ALL') + @CRLF
     + '    @TopN           = ' + CAST(@TopN AS VARCHAR(10)) + @CRLF
@@ -9424,11 +9464,9 @@ BEGIN
             ELSE TotalLogicalReads
           END DESC
        ) AS rn
-    FROM indexing.ExpensiveQueryResults
+    FROM optimize.ExpensiveQueryResults
     WHERE ResolvedDate IS NULL
-      AND (@DatabaseName IS NULL
-              OR (@DatabaseName LIKE '%[%]%' AND DatabaseName LIKE @DatabaseName)
-              OR (@DatabaseName NOT LIKE '%[%]%' AND DatabaseName IN (SELECT LTRIM(RTRIM(value)) FROM STRING_SPLIT(@DatabaseName, ','))))
+      AND DatabaseName IN (SELECT DatabaseName FROM optimize.fn_GetDatabases(@Databases))
       AND (@TableName    IS NULL OR TableName    = @TableName)
       AND (@FindingType  IS NULL OR FindingType  = @FindingType)
       AND EXISTS (SELECT 1 FROM sys.databases WHERE name = DatabaseName)
@@ -9458,11 +9496,9 @@ BEGIN
           ,MissingIndexKeys, MissingIndexIncludes, MissingIndexImpact
           ,RegressionFactor, SampleQueryText, FindingDetail, Recommendation
           ,CreateStatement, EstimatedSizeGB, DataSource
-    FROM indexing.ExpensiveQueryResults
+    FROM optimize.ExpensiveQueryResults
     WHERE ResolvedDate IS NULL
-      AND (@DatabaseName IS NULL
-              OR (@DatabaseName LIKE '%[%]%' AND DatabaseName LIKE @DatabaseName)
-              OR (@DatabaseName NOT LIKE '%[%]%' AND DatabaseName IN (SELECT LTRIM(RTRIM(value)) FROM STRING_SPLIT(@DatabaseName, ','))))
+      AND DatabaseName IN (SELECT DatabaseName FROM optimize.fn_GetDatabases(@Databases))
       AND (@TableName    IS NULL OR TableName    = @TableName)
       AND (@FindingType  IS NULL OR FindingType  = @FindingType)
       AND EXISTS (SELECT 1 FROM sys.databases WHERE name = DatabaseName)
@@ -9592,20 +9628,20 @@ BEGIN
         SET @LargeCount = @LargeCount + 1;
         SET @ScriptText = @ScriptText
           + @CRLF + '/*' + @CRLF + @CreateStmt + @CRLF + '*/' + @CRLF
-          + @CRLF + '/* UPDATE DBA_Utilities.indexing.ExpensiveQueryResults SET ResolvedDate = GETDATE() WHERE ExpensiveQueryId = ' + CAST(@Id AS VARCHAR(10)) + '; */' + @CRLF;
+          + @CRLF + '/* UPDATE DBA_Utilities.optimize.ExpensiveQueryResults SET ResolvedDate = GETDATE() WHERE ExpensiveQueryId = ' + CAST(@Id AS VARCHAR(10)) + '; */' + @CRLF;
       END
       ELSE
       BEGIN
         SET @RunnableCount = @RunnableCount + 1;
         SET @ScriptText = @ScriptText
           + @CRLF + @CreateStmt + @CRLF
-          + @CRLF + 'UPDATE DBA_Utilities.indexing.ExpensiveQueryResults SET ResolvedDate = GETDATE() WHERE ExpensiveQueryId = ' + CAST(@Id AS VARCHAR(10)) + ';' + @CRLF;
+          + @CRLF + 'UPDATE DBA_Utilities.optimize.ExpensiveQueryResults SET ResolvedDate = GETDATE() WHERE ExpensiveQueryId = ' + CAST(@Id AS VARCHAR(10)) + ';' + @CRLF;
       END
     END
     ELSE
     BEGIN
       SET @ScriptText = @ScriptText
-        + @CRLF + 'UPDATE DBA_Utilities.indexing.ExpensiveQueryResults SET ResolvedDate = GETDATE() WHERE ExpensiveQueryId = ' + CAST(@Id AS VARCHAR(10)) + ';' + @CRLF;
+        + @CRLF + 'UPDATE DBA_Utilities.optimize.ExpensiveQueryResults SET ResolvedDate = GETDATE() WHERE ExpensiveQueryId = ' + CAST(@Id AS VARCHAR(10)) + ';' + @CRLF;
     END
 
     FETCH NEXT FROM rec_cursor INTO @Id, @DB, @FType, @Schema, @Table, @IdxName
@@ -9622,12 +9658,12 @@ BEGIN
 
   DECLARE @TotalUnfiltered INT;
   SELECT @TotalUnfiltered = COUNT(*)
-  FROM indexing.ExpensiveQueryResults
+  FROM optimize.ExpensiveQueryResults
   WHERE ResolvedDate IS NULL
     AND EXISTS (SELECT 1 FROM sys.databases WHERE name = DatabaseName);
 
   SELECT @@SERVERNAME                                AS ServerName
-        ,ISNULL(@DatabaseName, 'ALL')                AS DatabaseName
+        ,ISNULL(@Databases, 'ALL')                   AS DatabaseName
         ,GETDATE()                                   AS GeneratedDate
         ,CAST(@TotalRecs AS VARCHAR(10)) + ' findings ('
          + CAST(@TotalScans AS VARCHAR(10)) + ' scans, '
@@ -9655,12 +9691,22 @@ GO
 -- COLUMN ACCESS PATTERN ANALYSIS
 -- ==========================================================================
 
+/*
+    SQL Server Optimization Suite
+    Default Database: DBA_Utilities
+
+    To install in a different database, find and replace all instances of
+    "DBA_Utilities" with your database name before running this script.
+*/
+USE DBA_Utilities;
+GO
+
 -- =========================================================================
--- Table: indexing.ColumnAccessPatternResults
+-- Table: optimize.ColumnAccessPatternResults
 -- =========================================================================
-IF OBJECT_ID('indexing.ColumnAccessPatternResults', 'U') IS NULL
+IF OBJECT_ID('optimize.ColumnAccessPatternResults', 'U') IS NULL
 BEGIN
-  CREATE TABLE indexing.ColumnAccessPatternResults
+  CREATE TABLE optimize.ColumnAccessPatternResults
     (ColumnAccessPatternId INT            IDENTITY(1, 1)
     ,ServerName            NVARCHAR(128)  NOT NULL
     ,DatabaseName          NVARCHAR(128)  NOT NULL
@@ -9682,45 +9728,24 @@ END
 GO
 
 -- =========================================================================
--- Proc: indexing.sp_ColumnAccessPatternAnalysis
+-- Proc: optimize.sp_ColumnAccessPatternAnalysis
 -- =========================================================================
-CREATE OR ALTER PROCEDURE indexing.sp_ColumnAccessPatternAnalysis
-  @DatabaseName     NVARCHAR(MAX) = NULL
+CREATE OR ALTER PROCEDURE optimize.sp_ColumnAccessPatternAnalysis
+  @Databases        NVARCHAR(MAX) = NULL
  ,@TopN             INT           = 200
  ,@MinQueryCount    INT           = 3
 AS
 BEGIN
   SET NOCOUNT ON;
 
-  DELETE FROM indexing.ColumnAccessPatternResults WHERE ResolvedDate IS NULL;
+  DELETE FROM optimize.ColumnAccessPatternResults WHERE ResolvedDate IS NULL;
 
   DROP TABLE IF EXISTS #DBs;
   CREATE TABLE #DBs (DatabaseName NVARCHAR(128), rn INT);
 
-  IF @DatabaseName IS NULL
-  BEGIN
-    INSERT INTO #DBs (DatabaseName, rn)
-    SELECT d.name, ROW_NUMBER() OVER (ORDER BY d.name)
-    FROM sys.databases d
-    WHERE d.state_desc = 'ONLINE'
-      AND d.database_id > 4;
-  END
-  ELSE IF @DatabaseName LIKE '%[%]%'
-  BEGIN
-    INSERT INTO #DBs (DatabaseName, rn)
-    SELECT d.name, ROW_NUMBER() OVER (ORDER BY d.name)
-    FROM sys.databases d
-    WHERE d.state_desc = 'ONLINE'
-      AND d.name LIKE @DatabaseName;
-  END
-  ELSE
-  BEGIN
-    INSERT INTO #DBs (DatabaseName, rn)
-    SELECT d.name, ROW_NUMBER() OVER (ORDER BY d.name)
-    FROM sys.databases d
-    INNER JOIN STRING_SPLIT(@DatabaseName, ',') s ON d.name = LTRIM(RTRIM(s.value))
-    WHERE d.state_desc = 'ONLINE';
-  END;
+  INSERT INTO #DBs (DatabaseName, rn)
+  SELECT DatabaseName, ROW_NUMBER() OVER (ORDER BY DatabaseName)
+  FROM optimize.fn_GetDatabases(@Databases);
 
   DROP TABLE IF EXISTS #TopPlans;
   SELECT TOP (@TopN)
@@ -9783,7 +9808,7 @@ BEGIN
   DELETE FROM #RawColumnAccess
   WHERE DatabaseName NOT IN (SELECT DatabaseName FROM #DBs);
 
-  INSERT INTO indexing.ColumnAccessPatternResults
+  INSERT INTO optimize.ColumnAccessPatternResults
     (ServerName, DatabaseName, SchemaName, TableName, ColumnName, UsageType
     ,QueryCount, TotalExecutions, TotalLogicalReads, DataSource)
   SELECT
@@ -9818,7 +9843,7 @@ BEGIN
 
     UPDATE r
     SET r.ExistingIndexCoverage = idx.coverage
-    FROM DBA_Utilities.indexing.ColumnAccessPatternResults r
+    FROM DBA_Utilities.optimize.ColumnAccessPatternResults r
     OUTER APPLY (
       SELECT TOP 1
         CASE
@@ -9854,7 +9879,7 @@ BEGIN
     SET @i = @i - 1;
   END;
 
-  UPDATE indexing.ColumnAccessPatternResults
+  UPDATE optimize.ColumnAccessPatternResults
   SET SuggestedAction = CASE
     WHEN ExistingIndexCoverage IS NULL AND UsageType IN ('EQUALITY', 'SEEK_PREDICATE') THEN 'Consider as leading key column in a new index'
     WHEN ExistingIndexCoverage IS NULL AND UsageType = 'INEQUALITY' THEN 'Consider as secondary key column in a new index'
@@ -9874,10 +9899,10 @@ END;
 GO
 
 -- =========================================================================
--- Proc: indexing.sp_ColumnAccessPatternRecommendations
+-- Proc: optimize.sp_ColumnAccessPatternRecommendations
 -- =========================================================================
-CREATE OR ALTER PROCEDURE indexing.sp_ColumnAccessPatternRecommendations
-  @DatabaseName     NVARCHAR(MAX) = NULL
+CREATE OR ALTER PROCEDURE optimize.sp_ColumnAccessPatternRecommendations
+  @Databases        NVARCHAR(MAX) = NULL
  ,@TableName        NVARCHAR(128) = NULL
  ,@RunnableUnder    VARCHAR(20)   = NULL
  ,@RunAnalysis      BIT           = 0
@@ -9889,8 +9914,8 @@ BEGIN
   SET NOCOUNT ON;
 
   IF @RunAnalysis = 1
-    EXEC indexing.sp_ColumnAccessPatternAnalysis
-        @DatabaseName  = @DatabaseName
+    EXEC optimize.sp_ColumnAccessPatternAnalysis
+        @Databases     = @Databases
        ,@TopN          = @TopN
        ,@MinQueryCount = @MinQueryCount;
 
@@ -9924,11 +9949,9 @@ BEGIN
 
   SELECT @TotalPatterns   = COUNT(*)
         ,@TotalUncovered  = SUM(CASE WHEN ExistingIndexCoverage IS NULL THEN 1 ELSE 0 END)
-  FROM indexing.ColumnAccessPatternResults
+  FROM optimize.ColumnAccessPatternResults
   WHERE ResolvedDate IS NULL
-    AND (@DatabaseName IS NULL
-              OR (@DatabaseName LIKE '%[%]%' AND DatabaseName LIKE @DatabaseName)
-              OR (@DatabaseName NOT LIKE '%[%]%' AND DatabaseName IN (SELECT LTRIM(RTRIM(value)) FROM STRING_SPLIT(@DatabaseName, ','))))
+    AND DatabaseName IN (SELECT DatabaseName FROM optimize.fn_GetDatabases(@Databases))
     AND (@TableName    IS NULL OR TableName    = @TableName)
     AND (@ShowCovered = 1 OR ExistingIndexCoverage IS NULL OR ExistingIndexCoverage <> 'LEADING_KEY')
     AND EXISTS (SELECT 1 FROM sys.databases WHERE name = DatabaseName);
@@ -9960,13 +9983,11 @@ BEGIN
            END,
            QueryCount DESC, TotalLogicalReads DESC
        ) AS key_order
-    FROM indexing.ColumnAccessPatternResults
+    FROM optimize.ColumnAccessPatternResults
     WHERE ResolvedDate IS NULL
       AND UsageType IN ('EQUALITY', 'INEQUALITY', 'SEEK_PREDICATE', 'SCAN_PREDICATE')
       AND (ExistingIndexCoverage IS NULL OR ExistingIndexCoverage <> 'LEADING_KEY')
-      AND (@DatabaseName IS NULL
-              OR (@DatabaseName LIKE '%[%]%' AND DatabaseName LIKE @DatabaseName)
-              OR (@DatabaseName NOT LIKE '%[%]%' AND DatabaseName IN (SELECT LTRIM(RTRIM(value)) FROM STRING_SPLIT(@DatabaseName, ','))))
+      AND DatabaseName IN (SELECT DatabaseName FROM optimize.fn_GetDatabases(@Databases))
       AND (@TableName IS NULL OR TableName = @TableName)
       AND EXISTS (SELECT 1 FROM sys.databases WHERE name = DatabaseName)
   )
@@ -9979,7 +10000,7 @@ BEGIN
             ORDER BY c2.key_order
             FOR XML PATH(''), TYPE).value('.', 'NVARCHAR(MAX)'), 1, 2, '')
     ,STUFF((SELECT ', [' + i2.ColumnName + ']'
-            FROM indexing.ColumnAccessPatternResults i2
+            FROM optimize.ColumnAccessPatternResults i2
             WHERE i2.DatabaseName = c.DatabaseName AND i2.SchemaName = c.SchemaName AND i2.TableName = c.TableName
               AND i2.ResolvedDate IS NULL
               AND i2.UsageType = 'INCLUDE'
@@ -10107,7 +10128,7 @@ BEGIN
     SET @seSchemaTable = QUOTENAME(@seSchema) + '.' + QUOTENAME(@seTable);
 
     BEGIN TRY
-      EXEC indexing.sp_GetHybridIndexSizeEstimate
+      EXEC optimize.sp_GetHybridIndexSizeEstimate
           @DatabaseName      = @seDB,
           @SchemaTable       = @seSchemaTable,
           @RecKeyColumns     = @seKeys,
@@ -10155,7 +10176,7 @@ BEGIN
     + '    Not Indexed:        ' + CAST(@TotalUncovered AS VARCHAR(10)) + @CRLF
     + @CRLF
     + 'Filters:' + @CRLF
-    + '    @DatabaseName   = ' + ISNULL('''' + @DatabaseName + '''', 'ALL') + @CRLF
+    + '    @Databases      = ' + ISNULL('''' + @Databases + '''', 'ALL') + @CRLF
     + '    @TableName      = ' + ISNULL('''' + @TableName + '''', 'ALL') + @CRLF
     + '    @MinQueryCount  = ' + CAST(@MinQueryCount AS VARCHAR(10)) + @CRLF
     + '    @RunnableUnder  = ' + ISNULL('''' + @RunnableUnder + '''', 'NULL (all uncommented)') + @CRLF
@@ -10199,11 +10220,9 @@ BEGIN
     SELECT ColumnAccessPatternId, DatabaseName, SchemaName, TableName
           ,ColumnName, UsageType, QueryCount, TotalExecutions, TotalLogicalReads
           ,ExistingIndexCoverage, SuggestedAction
-    FROM indexing.ColumnAccessPatternResults
+    FROM optimize.ColumnAccessPatternResults
     WHERE ResolvedDate IS NULL
-      AND (@DatabaseName IS NULL
-              OR (@DatabaseName LIKE '%[%]%' AND DatabaseName LIKE @DatabaseName)
-              OR (@DatabaseName NOT LIKE '%[%]%' AND DatabaseName IN (SELECT LTRIM(RTRIM(value)) FROM STRING_SPLIT(@DatabaseName, ','))))
+      AND DatabaseName IN (SELECT DatabaseName FROM optimize.fn_GetDatabases(@Databases))
       AND (@TableName    IS NULL OR TableName    = @TableName)
       AND (@ShowCovered = 1 OR ExistingIndexCoverage IS NULL OR ExistingIndexCoverage <> 'LEADING_KEY')
       AND EXISTS (SELECT 1 FROM sys.databases WHERE name = DatabaseName)
@@ -10272,7 +10291,7 @@ BEGIN
       , CHAR(13) + CHAR(10)) WITHIN GROUP (ORDER BY TotalLogicalReads DESC)
       FROM (
         SELECT TOP 10 ColumnName, UsageType, QueryCount, TotalLogicalReads, ExistingIndexCoverage
-        FROM indexing.ColumnAccessPatternResults
+        FROM optimize.ColumnAccessPatternResults
         WHERE ResolvedDate IS NULL
           AND DatabaseName = @DB AND SchemaName = @Schema AND TableName = @Table
           AND (@ShowCovered = 1 OR ExistingIndexCoverage IS NULL OR ExistingIndexCoverage <> 'LEADING_KEY')
@@ -10310,7 +10329,7 @@ BEGIN
 
         SET @ResolveIds = NULL;
         SELECT @ResolveIds = STRING_AGG(CAST(ColumnAccessPatternId AS VARCHAR(10)), ',')
-        FROM indexing.ColumnAccessPatternResults
+        FROM optimize.ColumnAccessPatternResults
         WHERE ResolvedDate IS NULL
           AND DatabaseName = @DB AND SchemaName = @Schema AND TableName = @Table;
 
@@ -10326,7 +10345,7 @@ BEGIN
 
           IF @ResolveIds IS NOT NULL
             SET @ScriptText = @ScriptText
-              + @CRLF + '/* UPDATE DBA_Utilities.indexing.ColumnAccessPatternResults SET ResolvedDate = GETDATE() WHERE ColumnAccessPatternId IN (' + @ResolveIds + '); */' + @CRLF;
+              + @CRLF + '/* UPDATE DBA_Utilities.optimize.ColumnAccessPatternResults SET ResolvedDate = GETDATE() WHERE ColumnAccessPatternId IN (' + @ResolveIds + '); */' + @CRLF;
         END
         ELSE
         BEGIN
@@ -10336,7 +10355,7 @@ BEGIN
 
           IF @ResolveIds IS NOT NULL
             SET @ScriptText = @ScriptText
-              + @CRLF + 'UPDATE DBA_Utilities.indexing.ColumnAccessPatternResults SET ResolvedDate = GETDATE() WHERE ColumnAccessPatternId IN (' + @ResolveIds + ');' + @CRLF;
+              + @CRLF + 'UPDATE DBA_Utilities.optimize.ColumnAccessPatternResults SET ResolvedDate = GETDATE() WHERE ColumnAccessPatternId IN (' + @ResolveIds + ');' + @CRLF;
         END
       END
       ELSE
@@ -10356,12 +10375,12 @@ BEGIN
 
   DECLARE @TotalUnfiltered INT;
   SELECT @TotalUnfiltered = COUNT(*)
-  FROM indexing.ColumnAccessPatternResults
+  FROM optimize.ColumnAccessPatternResults
   WHERE ResolvedDate IS NULL
     AND EXISTS (SELECT 1 FROM sys.databases WHERE name = DatabaseName);
 
   SELECT @@SERVERNAME                                AS ServerName
-        ,ISNULL(@DatabaseName, 'ALL')                AS DatabaseName
+        ,ISNULL(@Databases, 'ALL')                   AS DatabaseName
         ,GETDATE()                                   AS GeneratedDate
         ,CAST(@TotalTables AS VARCHAR(10)) + ' recommendations, '
          + CAST(@TotalPatterns AS VARCHAR(10)) + ' column patterns'
@@ -10385,14 +10404,14 @@ GO
 -- SCHEMA MIGRATIONS
 -- ==========================================================================
 
-IF COL_LENGTH('indexing.IndexOptimizationResults', 'EstimatedSizeGB') IS NULL
-    ALTER TABLE indexing.IndexOptimizationResults ADD EstimatedSizeGB DECIMAL(18,2) NULL;
+IF COL_LENGTH('optimize.IndexOptimizationResults', 'EstimatedSizeGB') IS NULL
+    ALTER TABLE optimize.IndexOptimizationResults ADD EstimatedSizeGB DECIMAL(18,2) NULL;
 GO
-IF COL_LENGTH('indexing.KeyLookupResults', 'EstimatedSizeGB') IS NULL
-    ALTER TABLE indexing.KeyLookupResults ADD EstimatedSizeGB DECIMAL(18,2) NULL;
+IF COL_LENGTH('optimize.KeyLookupResults', 'EstimatedSizeGB') IS NULL
+    ALTER TABLE optimize.KeyLookupResults ADD EstimatedSizeGB DECIMAL(18,2) NULL;
 GO
-IF COL_LENGTH('indexing.ExpensiveQueryResults', 'EstimatedSizeGB') IS NULL
-    ALTER TABLE indexing.ExpensiveQueryResults ADD EstimatedSizeGB DECIMAL(18,2) NULL;
+IF COL_LENGTH('optimize.ExpensiveQueryResults', 'EstimatedSizeGB') IS NULL
+    ALTER TABLE optimize.ExpensiveQueryResults ADD EstimatedSizeGB DECIMAL(18,2) NULL;
 GO
 
 
@@ -10400,11 +10419,21 @@ GO
 -- SUITE: ORCHESTRATOR + SUMMARY + SHARED UTILITY
 -- ==========================================================================
 
+/*
+    SQL Server Optimization Suite
+    Default Database: DBA_Utilities
+
+    To install in a different database, find and replace all instances of
+    "DBA_Utilities" with your database name before running this script.
+*/
+USE DBA_Utilities;
+GO
+
 -- ==========================================================================
--- Shared Utility: indexing.sp_BuildIndexScript
+-- Shared Utility: optimize.sp_BuildIndexScript
 -- ==========================================================================
 
-CREATE OR ALTER PROCEDURE indexing.sp_BuildIndexScript
+CREATE OR ALTER PROCEDURE optimize.sp_BuildIndexScript
     @DatabaseName      NVARCHAR(128),
     @SchemaName        NVARCHAR(128),
     @TableName         NVARCHAR(128),
@@ -10786,12 +10815,12 @@ END
 GO
 
 -- ==========================================================================
--- Fleet Summary: indexing.sp_IndexingSuiteSummary
+-- Fleet Summary: optimize.sp_IndexingSuiteSummary
 -- ==========================================================================
 
-CREATE OR ALTER PROCEDURE indexing.sp_IndexingSuiteSummary
+CREATE OR ALTER PROCEDURE optimize.sp_IndexingSuiteSummary
     @Days INT = 30,
-    @DatabaseName NVARCHAR(128) = NULL,
+    @Databases NVARCHAR(MAX) = NULL,
     @Detail BIT = 0
 AS
 BEGIN
@@ -10804,9 +10833,9 @@ BEGIN
     RAISERROR(@Msg, 10, 1) WITH NOWAIT;
     SET @Msg = 'Server: ' + @@SERVERNAME + '  |  Since: ' + CONVERT(VARCHAR(10), @Since, 120);
     RAISERROR(@Msg, 10, 1) WITH NOWAIT;
-    IF @DatabaseName IS NOT NULL
+    IF @Databases IS NOT NULL
     BEGIN
-        SET @Msg = 'Database: ' + @DatabaseName;
+        SET @Msg = 'Databases: ' + @Databases;
         RAISERROR(@Msg, 10, 1) WITH NOWAIT;
     END
     IF @Detail = 1
@@ -10840,7 +10869,7 @@ BEGIN
     ---------------------------------------------------------------------------
     -- 1. Duplicate Index Detection
     ---------------------------------------------------------------------------
-    IF OBJECT_ID('indexing.IndexOptimizationResults', 'U') IS NOT NULL
+    IF OBJECT_ID('optimize.IndexOptimizationResults', 'U') IS NOT NULL
     BEGIN
         INSERT INTO #Summary (SortOrder, Tool, Resolved, Pending, Databases, Tables, Indexes, SizeSavedMB, WritesEliminated, Detail)
         SELECT
@@ -10864,14 +10893,14 @@ BEGIN
             + CAST(SUM(CASE WHEN ResolvedDate >= @Since AND ActionType = 'REDUNDANT' THEN 1 ELSE 0 END) AS VARCHAR(10)) + ' redundant, '
             + CAST(SUM(CASE WHEN ResolvedDate >= @Since AND ActionType = 'DUPLICATE of PK' THEN 1 ELSE 0 END) AS VARCHAR(10)) + ' PK dup, '
             + CAST(SUM(CASE WHEN ResolvedDate >= @Since AND ActionType = 'COMBINE' THEN 1 ELSE 0 END) AS VARCHAR(10)) + ' combine'
-        FROM indexing.IndexOptimizationResults
-        WHERE (@DatabaseName IS NULL OR DatabaseName = @DatabaseName);
+        FROM optimize.IndexOptimizationResults
+        WHERE DatabaseName IN (SELECT DatabaseName FROM optimize.fn_GetDatabases(@Databases));
     END
 
     ---------------------------------------------------------------------------
     -- 2. Key Lookup Elimination
     ---------------------------------------------------------------------------
-    IF OBJECT_ID('indexing.KeyLookupResults', 'U') IS NOT NULL
+    IF OBJECT_ID('optimize.KeyLookupResults', 'U') IS NOT NULL
     BEGIN
         INSERT INTO #Summary (SortOrder, Tool, Resolved, Pending, Databases, Tables, Indexes, ReadsImpacted, ExecutionsAffected, Detail)
         SELECT
@@ -10886,14 +10915,14 @@ BEGIN
             SUM(CASE WHEN ResolvedDate >= @Since THEN ISNULL(TotalExecutions, 0) ELSE 0 END),
             CAST(SUM(CASE WHEN ResolvedDate >= @Since THEN ISNULL(PlanCount, 0) ELSE 0 END) AS VARCHAR(10)) + ' plans across '
             + CAST(COUNT(DISTINCT CASE WHEN ResolvedDate >= @Since THEN NCIndexName END) AS VARCHAR(10)) + ' indexes'
-        FROM indexing.KeyLookupResults
-        WHERE (@DatabaseName IS NULL OR DatabaseName = @DatabaseName);
+        FROM optimize.KeyLookupResults
+        WHERE DatabaseName IN (SELECT DatabaseName FROM optimize.fn_GetDatabases(@Databases));
     END
 
     ---------------------------------------------------------------------------
     -- 3. Unused Index Detection
     ---------------------------------------------------------------------------
-    IF OBJECT_ID('indexing.UnusedIndexResults', 'U') IS NOT NULL
+    IF OBJECT_ID('optimize.UnusedIndexResults', 'U') IS NOT NULL
     BEGIN
         INSERT INTO #Summary (SortOrder, Tool, Resolved, Pending, Databases, Tables, Indexes, SizeSavedMB, WritesEliminated, Detail)
         SELECT
@@ -10910,14 +10939,14 @@ BEGIN
             + CAST(SUM(CASE WHEN ResolvedDate >= @Since AND Confidence = 'HIGH' THEN 1 ELSE 0 END) AS VARCHAR(10)) + ' high, '
             + CAST(SUM(CASE WHEN ResolvedDate >= @Since AND Confidence = 'MEDIUM' THEN 1 ELSE 0 END) AS VARCHAR(10)) + ' medium, '
             + CAST(SUM(CASE WHEN ResolvedDate >= @Since AND Confidence = 'LOW' THEN 1 ELSE 0 END) AS VARCHAR(10)) + ' low'
-        FROM indexing.UnusedIndexResults
-        WHERE (@DatabaseName IS NULL OR DatabaseName = @DatabaseName);
+        FROM optimize.UnusedIndexResults
+        WHERE DatabaseName IN (SELECT DatabaseName FROM optimize.fn_GetDatabases(@Databases));
     END
 
     ---------------------------------------------------------------------------
     -- 4. Expensive Query Plan Analysis
     ---------------------------------------------------------------------------
-    IF OBJECT_ID('indexing.ExpensiveQueryResults', 'U') IS NOT NULL
+    IF OBJECT_ID('optimize.ExpensiveQueryResults', 'U') IS NOT NULL
     BEGIN
         INSERT INTO #Summary (SortOrder, Tool, Resolved, Pending, Databases, Tables, Indexes, ReadsImpacted, ExecutionsAffected, CPUTimeSavedMs, Detail)
         SELECT
@@ -10934,14 +10963,14 @@ BEGIN
             CAST(SUM(CASE WHEN ResolvedDate >= @Since AND FindingType = 'TABLE_SCAN' THEN 1 ELSE 0 END) AS VARCHAR(10)) + ' scans, '
             + CAST(SUM(CASE WHEN ResolvedDate >= @Since AND FindingType = 'MISSING_INDEX' THEN 1 ELSE 0 END) AS VARCHAR(10)) + ' missing idx, '
             + CAST(SUM(CASE WHEN ResolvedDate >= @Since AND FindingType = 'REGRESSED_QUERY' THEN 1 ELSE 0 END) AS VARCHAR(10)) + ' regressed'
-        FROM indexing.ExpensiveQueryResults
-        WHERE (@DatabaseName IS NULL OR DatabaseName = @DatabaseName);
+        FROM optimize.ExpensiveQueryResults
+        WHERE DatabaseName IN (SELECT DatabaseName FROM optimize.fn_GetDatabases(@Databases));
     END
 
     ---------------------------------------------------------------------------
     -- 5. Column Access Pattern Analysis
     ---------------------------------------------------------------------------
-    IF OBJECT_ID('indexing.ColumnAccessPatternResults', 'U') IS NOT NULL
+    IF OBJECT_ID('optimize.ColumnAccessPatternResults', 'U') IS NOT NULL
     BEGIN
         INSERT INTO #Summary (SortOrder, Tool, Resolved, Pending, Databases, Tables, ReadsImpacted, ExecutionsAffected, Detail)
         SELECT
@@ -10955,14 +10984,14 @@ BEGIN
             SUM(CASE WHEN ResolvedDate >= @Since THEN ISNULL(TotalExecutions, 0) ELSE 0 END),
             CAST(COUNT(DISTINCT CASE WHEN ResolvedDate >= @Since THEN ColumnName END) AS VARCHAR(10)) + ' columns across '
             + CAST(SUM(CASE WHEN ResolvedDate >= @Since THEN ISNULL(QueryCount, 0) ELSE 0 END) AS VARCHAR(10)) + ' query refs'
-        FROM indexing.ColumnAccessPatternResults
-        WHERE (@DatabaseName IS NULL OR DatabaseName = @DatabaseName);
+        FROM optimize.ColumnAccessPatternResults
+        WHERE DatabaseName IN (SELECT DatabaseName FROM optimize.fn_GetDatabases(@Databases));
     END
 
     ---------------------------------------------------------------------------
     -- 6. Missing Index Recommendations (optimize-index)
     ---------------------------------------------------------------------------
-    IF OBJECT_ID('indexing.GeneratedScripts', 'U') IS NOT NULL
+    IF OBJECT_ID('optimize.GeneratedScripts', 'U') IS NOT NULL
     BEGIN
         INSERT INTO #Summary (SortOrder, Tool, Resolved, Pending, Databases, Detail)
         SELECT
@@ -10977,14 +11006,14 @@ BEGIN
             + CASE WHEN SUM(CASE WHEN Status LIKE '%Enterprise Bypass%' THEN 1 ELSE 0 END) > 0
                    THEN ', ' + CAST(SUM(CASE WHEN Status LIKE '%Enterprise Bypass%' THEN 1 ELSE 0 END) AS VARCHAR(10)) + ' enterprise bypass'
                    ELSE '' END
-        FROM indexing.GeneratedScripts
-        WHERE (@DatabaseName IS NULL OR DatabaseName = @DatabaseName);
+        FROM optimize.GeneratedScripts
+        WHERE DatabaseName IN (SELECT DatabaseName FROM optimize.fn_GetDatabases(@Databases));
     END
 
     ---------------------------------------------------------------------------
     -- 7. Index Maintenance
     ---------------------------------------------------------------------------
-    IF OBJECT_ID('indexing.IndexMaintenanceHistory', 'U') IS NOT NULL
+    IF OBJECT_ID('optimize.IndexMaintenanceHistory', 'U') IS NOT NULL
     BEGIN
         INSERT INTO #Summary (SortOrder, Tool, Resolved, Databases, Tables, Indexes, SizeSavedMB, DurationSec, Runs, Detail)
         SELECT
@@ -11008,10 +11037,10 @@ BEGIN
             + CASE WHEN SUM(CASE WHEN Status = 'TimeLimitReached' THEN 1 ELSE 0 END) > 0
                    THEN ', ' + CAST(SUM(CASE WHEN Status = 'TimeLimitReached' THEN 1 ELSE 0 END) AS VARCHAR(10)) + ' time-limited'
                    ELSE '' END
-        FROM indexing.IndexMaintenanceHistory
+        FROM optimize.IndexMaintenanceHistory
         WHERE CreatedDate >= @Since
           AND Status <> 'DryRun'
-          AND (@DatabaseName IS NULL OR DatabaseName = @DatabaseName);
+          AND DatabaseName IN (SELECT DatabaseName FROM optimize.fn_GetDatabases(@Databases));
     END
 
     ---------------------------------------------------------------------------
@@ -11034,7 +11063,7 @@ BEGIN
             + ', ' + FORMAT(SUM(ISNULL(Modifications, 0)), 'N0') + ' total modifications'
         FROM dbo.StatisticsUpdate
         WHERE UpdateDate >= @Since
-          AND (@DatabaseName IS NULL OR DatabaseName = @DatabaseName);
+          AND DatabaseName IN (SELECT DatabaseName FROM optimize.fn_GetDatabases(@Databases));
     END
 
     ---------------------------------------------------------------------------
@@ -11086,10 +11115,10 @@ BEGIN
     BEGIN
 
         -- 1. Duplicate Index Detail
-        IF OBJECT_ID('indexing.IndexOptimizationResults', 'U') IS NOT NULL
+        IF OBJECT_ID('optimize.IndexOptimizationResults', 'U') IS NOT NULL
         BEGIN
-            IF EXISTS (SELECT 1 FROM indexing.IndexOptimizationResults
-                        WHERE ResolvedDate >= @Since AND (@DatabaseName IS NULL OR DatabaseName = @DatabaseName))
+            IF EXISTS (SELECT 1 FROM optimize.IndexOptimizationResults
+                        WHERE ResolvedDate >= @Since AND DatabaseName IN (SELECT DatabaseName FROM optimize.fn_GetDatabases(@Databases)))
             BEGIN
                 RAISERROR('', 10, 1) WITH NOWAIT;
                 RAISERROR('--- Duplicate Index Detail ---', 10, 1) WITH NOWAIT;
@@ -11103,18 +11132,18 @@ BEGIN
                     CAST(ISNULL(Index1SizeKB, 0) / 1024.0 AS DECIMAL(10,1)) AS Index1SizeMB,
                     Index2Name,
                     CAST(ISNULL(Index2SizeKB, 0) / 1024.0 AS DECIMAL(10,1)) AS Index2SizeMB
-                FROM indexing.IndexOptimizationResults
+                FROM optimize.IndexOptimizationResults
                 WHERE ResolvedDate >= @Since
-                  AND (@DatabaseName IS NULL OR DatabaseName = @DatabaseName)
+                  AND DatabaseName IN (SELECT DatabaseName FROM optimize.fn_GetDatabases(@Databases))
                 ORDER BY ResolvedDate DESC;
             END
         END
 
         -- 2. Key Lookup Elimination Detail
-        IF OBJECT_ID('indexing.KeyLookupResults', 'U') IS NOT NULL
+        IF OBJECT_ID('optimize.KeyLookupResults', 'U') IS NOT NULL
         BEGIN
-            IF EXISTS (SELECT 1 FROM indexing.KeyLookupResults
-                        WHERE ResolvedDate >= @Since AND (@DatabaseName IS NULL OR DatabaseName = @DatabaseName))
+            IF EXISTS (SELECT 1 FROM optimize.KeyLookupResults
+                        WHERE ResolvedDate >= @Since AND DatabaseName IN (SELECT DatabaseName FROM optimize.fn_GetDatabases(@Databases)))
             BEGIN
                 RAISERROR('--- Key Lookup Elimination Detail ---', 10, 1) WITH NOWAIT;
 
@@ -11127,18 +11156,18 @@ BEGIN
                     PlanCount,
                     FORMAT(TotalLogicalReads, 'N0') AS TotalLogicalReads,
                     FORMAT(TotalExecutions, 'N0')   AS TotalExecutions
-                FROM indexing.KeyLookupResults
+                FROM optimize.KeyLookupResults
                 WHERE ResolvedDate >= @Since
-                  AND (@DatabaseName IS NULL OR DatabaseName = @DatabaseName)
+                  AND DatabaseName IN (SELECT DatabaseName FROM optimize.fn_GetDatabases(@Databases))
                 ORDER BY ResolvedDate DESC;
             END
         END
 
         -- 3. Unused Index Detection Detail
-        IF OBJECT_ID('indexing.UnusedIndexResults', 'U') IS NOT NULL
+        IF OBJECT_ID('optimize.UnusedIndexResults', 'U') IS NOT NULL
         BEGIN
-            IF EXISTS (SELECT 1 FROM indexing.UnusedIndexResults
-                        WHERE ResolvedDate >= @Since AND (@DatabaseName IS NULL OR DatabaseName = @DatabaseName))
+            IF EXISTS (SELECT 1 FROM optimize.UnusedIndexResults
+                        WHERE ResolvedDate >= @Since AND DatabaseName IN (SELECT DatabaseName FROM optimize.fn_GetDatabases(@Databases)))
             BEGIN
                 RAISERROR('--- Unused Index Detail ---', 10, 1) WITH NOWAIT;
 
@@ -11152,18 +11181,18 @@ BEGIN
                     Confidence,
                     FORMAT(UserUpdates, 'N0') AS WriteOverhead,
                     DropStatement AS ActionStatement
-                FROM indexing.UnusedIndexResults
+                FROM optimize.UnusedIndexResults
                 WHERE ResolvedDate >= @Since
-                  AND (@DatabaseName IS NULL OR DatabaseName = @DatabaseName)
+                  AND DatabaseName IN (SELECT DatabaseName FROM optimize.fn_GetDatabases(@Databases))
                 ORDER BY ResolvedDate DESC;
             END
         END
 
         -- 4. Expensive Query Detail
-        IF OBJECT_ID('indexing.ExpensiveQueryResults', 'U') IS NOT NULL
+        IF OBJECT_ID('optimize.ExpensiveQueryResults', 'U') IS NOT NULL
         BEGIN
-            IF EXISTS (SELECT 1 FROM indexing.ExpensiveQueryResults
-                        WHERE ResolvedDate >= @Since AND (@DatabaseName IS NULL OR DatabaseName = @DatabaseName))
+            IF EXISTS (SELECT 1 FROM optimize.ExpensiveQueryResults
+                        WHERE ResolvedDate >= @Since AND DatabaseName IN (SELECT DatabaseName FROM optimize.fn_GetDatabases(@Databases)))
             BEGIN
                 RAISERROR('--- Expensive Query Detail ---', 10, 1) WITH NOWAIT;
 
@@ -11176,18 +11205,18 @@ BEGIN
                     FORMAT(TotalLogicalReads, 'N0') AS TotalLogicalReads,
                     FORMAT(TotalCPUTimeMs, 'N0')    AS TotalCPUTimeMs,
                     FORMAT(TotalExecutions, 'N0')    AS TotalExecutions
-                FROM indexing.ExpensiveQueryResults
+                FROM optimize.ExpensiveQueryResults
                 WHERE ResolvedDate >= @Since
-                  AND (@DatabaseName IS NULL OR DatabaseName = @DatabaseName)
+                  AND DatabaseName IN (SELECT DatabaseName FROM optimize.fn_GetDatabases(@Databases))
                 ORDER BY ResolvedDate DESC;
             END
         END
 
         -- 5. Column Access Pattern Detail
-        IF OBJECT_ID('indexing.ColumnAccessPatternResults', 'U') IS NOT NULL
+        IF OBJECT_ID('optimize.ColumnAccessPatternResults', 'U') IS NOT NULL
         BEGIN
-            IF EXISTS (SELECT 1 FROM indexing.ColumnAccessPatternResults
-                        WHERE ResolvedDate >= @Since AND (@DatabaseName IS NULL OR DatabaseName = @DatabaseName))
+            IF EXISTS (SELECT 1 FROM optimize.ColumnAccessPatternResults
+                        WHERE ResolvedDate >= @Since AND DatabaseName IN (SELECT DatabaseName FROM optimize.fn_GetDatabases(@Databases)))
             BEGIN
                 RAISERROR('--- Column Access Pattern Detail ---', 10, 1) WITH NOWAIT;
 
@@ -11201,19 +11230,19 @@ BEGIN
                     FORMAT(TotalLogicalReads, 'N0') AS TotalLogicalReads,
                     ExistingIndexCoverage,
                     SuggestedAction
-                FROM indexing.ColumnAccessPatternResults
+                FROM optimize.ColumnAccessPatternResults
                 WHERE ResolvedDate >= @Since
-                  AND (@DatabaseName IS NULL OR DatabaseName = @DatabaseName)
+                  AND DatabaseName IN (SELECT DatabaseName FROM optimize.fn_GetDatabases(@Databases))
                 ORDER BY ResolvedDate DESC;
             END
         END
 
         -- 6. Index Maintenance Detail
-        IF OBJECT_ID('indexing.IndexMaintenanceHistory', 'U') IS NOT NULL
+        IF OBJECT_ID('optimize.IndexMaintenanceHistory', 'U') IS NOT NULL
         BEGIN
-            IF EXISTS (SELECT 1 FROM indexing.IndexMaintenanceHistory
+            IF EXISTS (SELECT 1 FROM optimize.IndexMaintenanceHistory
                         WHERE CreatedDate >= @Since AND Status <> 'DryRun'
-                          AND (@DatabaseName IS NULL OR DatabaseName = @DatabaseName))
+                          AND DatabaseName IN (SELECT DatabaseName FROM optimize.fn_GetDatabases(@Databases)))
             BEGIN
                 RAISERROR('--- Index Maintenance Detail ---', 10, 1) WITH NOWAIT;
 
@@ -11229,11 +11258,11 @@ BEGIN
                     DurationSeconds  AS Seconds,
                     Status,
                     ErrorMessage
-                FROM indexing.IndexMaintenanceHistory
+                FROM optimize.IndexMaintenanceHistory
                 WHERE CreatedDate >= @Since
                   AND Status <> 'DryRun'
                   AND SchemaName <> '-'
-                  AND (@DatabaseName IS NULL OR DatabaseName = @DatabaseName)
+                  AND DatabaseName IN (SELECT DatabaseName FROM optimize.fn_GetDatabases(@Databases))
                 ORDER BY CreatedDate DESC;
             END
         END
@@ -11243,7 +11272,7 @@ BEGIN
         BEGIN
             IF EXISTS (SELECT 1 FROM dbo.StatisticsUpdate
                         WHERE UpdateDate >= @Since
-                          AND (@DatabaseName IS NULL OR DatabaseName = @DatabaseName))
+                          AND DatabaseName IN (SELECT DatabaseName FROM optimize.fn_GetDatabases(@Databases)))
             BEGIN
                 RAISERROR('--- Statistics Update Detail ---', 10, 1) WITH NOWAIT;
 
@@ -11257,7 +11286,7 @@ BEGIN
                     Outcome
                 FROM dbo.StatisticsUpdate
                 WHERE UpdateDate >= @Since
-                  AND (@DatabaseName IS NULL OR DatabaseName = @DatabaseName)
+                  AND DatabaseName IN (SELECT DatabaseName FROM optimize.fn_GetDatabases(@Databases))
                 ORDER BY UpdateDate DESC;
             END
         END
@@ -11268,11 +11297,11 @@ END
 GO
 
 -- ==========================================================================
--- Orchestrator: indexing.sp_IndexOptimizationSuite
+-- Orchestrator: optimize.sp_IndexOptimizationSuite
 -- ==========================================================================
 
-CREATE OR ALTER PROCEDURE indexing.sp_IndexOptimizationSuite
-    @DatabaseName        NVARCHAR(MAX)  = NULL,
+CREATE OR ALTER PROCEDURE optimize.sp_IndexOptimizationSuite
+    @Databases           NVARCHAR(MAX)  = NULL,
     @RunnableUnder       VARCHAR(20)    = NULL,  -- NULL=all uncommented, '2'=2GB both, '1,5e'=1GB Std/5GB Ent
     @LinkedServer        BIT            = 0,     -- When 1, wraps output in EXEC(...) AT [server] for running from ops
 
@@ -11339,7 +11368,7 @@ BEGIN
     RAISERROR('INDEX OPTIMIZATION SUITE', 10, 1) WITH NOWAIT;
     SET @Msg = 'Server: ' + @@SERVERNAME;
     RAISERROR(@Msg, 10, 1) WITH NOWAIT;
-    SET @Msg = 'Database: ' + REPLACE(ISNULL(@DatabaseName, 'ALL'), '%', '%%');
+    SET @Msg = 'Databases: ' + REPLACE(ISNULL(@Databases, 'USER_DATABASES'), '%', '%%');
     RAISERROR(@Msg, 10, 1) WITH NOWAIT;
     SET @Msg = 'Tools: ' + CAST(@TotalTools AS VARCHAR(10)) + ' selected';
     RAISERROR(@Msg, 10, 1) WITH NOWAIT;
@@ -11381,9 +11410,9 @@ BEGIN
 
         BEGIN TRY
             INSERT INTO #Step1
-            EXEC indexing.sp_DuplicateIndexOptimizationRecommendations
+            EXEC optimize.sp_DuplicateIndexOptimizationRecommendations
                 @RunAnalysis   = 1,
-                @DatabaseName  = @DatabaseName,
+                @Databases     = @Databases,
                 @RunnableUnder = @RunnableUnder;
 
             INSERT INTO #SuiteResults (ToolOrder, ToolName, ServerName, DatabaseName, GeneratedDate, [Statistics], Status, ScriptText, DurationSec)
@@ -11425,14 +11454,14 @@ BEGIN
             [Statistics] NVARCHAR(500), Status NVARCHAR(200), ScriptText NVARCHAR(MAX));
 
         BEGIN TRY
-            EXEC indexing.sp_KeyLookupAnalysis
-                @DatabaseName  = @DatabaseName,
+            EXEC optimize.sp_KeyLookupAnalysis
+                @Databases     = @Databases,
                 @MinExecutions = @MinExecutions;
 
             INSERT INTO #Step2
-            EXEC indexing.sp_KeyLookupRecommendations
+            EXEC optimize.sp_KeyLookupRecommendations
                 @RunAnalysis   = 0,
-                @DatabaseName  = @DatabaseName,
+                @Databases     = @Databases,
                 @RunnableUnder = @RunnableUnder,
                 @MinExecutions = @MinExecutions;
 
@@ -11471,9 +11500,9 @@ BEGIN
 
         BEGIN TRY
             INSERT INTO #Step3
-            EXEC indexing.sp_UnusedIndexRecommendations
+            EXEC optimize.sp_UnusedIndexRecommendations
                 @RunAnalysis    = 1,
-                @DatabaseName   = @DatabaseName,
+                @Databases      = @Databases,
                 @Action         = @Action,
                 @Confidence     = @Confidence,
                 @MinUpdateCount = @MinUpdateCount,
@@ -11510,17 +11539,17 @@ BEGIN
         RAISERROR(@Msg, 10, 1) WITH NOWAIT;
 
         BEGIN TRY
-            EXEC indexing.sp_LoadDataFromServer
+            EXEC optimize.sp_LoadDataFromServer
                 @ServerName        = @@SERVERNAME,
-                @DatabaseMode      = @DatabaseName,
+                @DatabaseMode      = @Databases,
                 @MinIndexAdvantage = 2500.0,
                 @MinAvgUserImpact  = 99.0;
 
-            EXEC indexing.sp_AnalyzeIndexStrategies;
+            EXEC optimize.sp_AnalyzeIndexStrategies;
 
-            EXEC indexing.sp_GenerateOptimizationScript
+            EXEC optimize.sp_GenerateOptimizationScript
                 @ServerName    = @@SERVERNAME,
-                @DatabaseName  = @DatabaseName,
+                @Databases     = @Databases,
                 @RunnableUnder = @RunnableUnder;
 
             IF @CombinedOutput = 0
@@ -11530,9 +11559,9 @@ BEGIN
                     GeneratedDate DATETIME, [Statistics] NVARCHAR(500), Status NVARCHAR(200), ScriptText NVARCHAR(MAX));
 
                 INSERT INTO #Step4
-                EXEC indexing.sp_MissingIndexRecommendations
+                EXEC optimize.sp_MissingIndexRecommendations
                     @RunAnalysis   = 0,
-                    @DatabaseName  = @DatabaseName,
+                    @Databases     = @Databases,
                     @RunnableUnder = @RunnableUnder;
 
                 INSERT INTO #SuiteResults (ToolOrder, ToolName, ServerName, DatabaseName, GeneratedDate, [Statistics], Status, ScriptText, DurationSec)
@@ -11547,11 +11576,11 @@ BEGIN
                 DECLARE @miResolved INT = 0, @miPending INT = 0;
                 SELECT @miResolved = COUNT(CASE WHEN ResolvedDate IS NOT NULL THEN 1 END),
                        @miPending = COUNT(CASE WHEN ResolvedDate IS NULL AND Strategy NOT IN ('SUPERSET_COVERED') THEN 1 END)
-                FROM indexing.MissingIndexResults
+                FROM optimize.MissingIndexResults
                 WHERE ServerName = @@SERVERNAME;
 
                 INSERT INTO #SuiteResults (ToolOrder, ToolName, ServerName, DatabaseName, GeneratedDate, [Statistics], Status, ScriptText, DurationSec)
-                VALUES (4, 'Missing Index', @@SERVERNAME, ISNULL(@DatabaseName, 'ALL'), GETDATE(),
+                VALUES (4, 'Missing Index', @@SERVERNAME, ISNULL(@Databases, 'USER_DATABASES'), GETDATE(),
                         CAST(@miPending AS VARCHAR(10)) + ' recommendations',
                         CASE WHEN @miPending > 0 THEN 'Has Recommendations' ELSE 'No Recommendations' END,
                         NULL,
@@ -11581,8 +11610,8 @@ BEGIN
         RAISERROR(@Msg, 10, 1) WITH NOWAIT;
 
         BEGIN TRY
-            EXEC indexing.sp_ExpensiveQueryAnalysis
-                @DatabaseName  = @DatabaseName,
+            EXEC optimize.sp_ExpensiveQueryAnalysis
+                @Databases     = @Databases,
                 @TopN          = @TopN,
                 @MinExecutions = @MinExecutions,
                 @MinImpact     = @MinImpact;
@@ -11594,9 +11623,9 @@ BEGIN
                     GeneratedDate DATETIME, [Statistics] NVARCHAR(500), Status NVARCHAR(200), ScriptText NVARCHAR(MAX));
 
                 INSERT INTO #Step5
-                EXEC indexing.sp_ExpensiveQueryRecommendations
+                EXEC optimize.sp_ExpensiveQueryRecommendations
                     @RunAnalysis   = 0,
-                    @DatabaseName  = @DatabaseName,
+                    @Databases     = @Databases,
                     @TopN          = @TopN,
                     @MinExecutions = @MinExecutions,
                     @MinImpact     = @MinImpact,
@@ -11614,11 +11643,11 @@ BEGIN
                 DECLARE @eqResolved INT = 0, @eqPending INT = 0;
                 SELECT @eqResolved = COUNT(CASE WHEN ResolvedDate IS NOT NULL THEN 1 END),
                        @eqPending = COUNT(CASE WHEN ResolvedDate IS NULL THEN 1 END)
-                FROM indexing.ExpensiveQueryResults
+                FROM optimize.ExpensiveQueryResults
                 WHERE ServerName = @@SERVERNAME;
 
                 INSERT INTO #SuiteResults (ToolOrder, ToolName, ServerName, DatabaseName, GeneratedDate, [Statistics], Status, ScriptText, DurationSec)
-                VALUES (5, 'Expensive Query', @@SERVERNAME, ISNULL(@DatabaseName, 'ALL'), GETDATE(),
+                VALUES (5, 'Expensive Query', @@SERVERNAME, ISNULL(@Databases, 'USER_DATABASES'), GETDATE(),
                         CAST(@eqResolved AS VARCHAR(10)) + ' resolved, ' + CAST(@eqPending AS VARCHAR(10)) + ' pending',
                         CASE WHEN @eqPending > 0 THEN 'Has Recommendations' ELSE 'No Recommendations' END,
                         NULL,
@@ -11654,9 +11683,9 @@ BEGIN
 
         BEGIN TRY
             INSERT INTO #Step6
-            EXEC indexing.sp_ColumnAccessPatternRecommendations
+            EXEC optimize.sp_ColumnAccessPatternRecommendations
                 @RunAnalysis   = 1,
-                @DatabaseName  = @DatabaseName,
+                @Databases     = @Databases,
                 @RunnableUnder = @RunnableUnder,
                 @TopN          = @TopN;
 
@@ -11718,30 +11747,30 @@ BEGIN
             TableName    NVARCHAR(128)
         );
 
-        IF @RunDuplicateIndex = 1 AND OBJECT_ID('indexing.IndexOptimizationResults', 'U') IS NOT NULL
+        IF @RunDuplicateIndex = 1 AND OBJECT_ID('optimize.IndexOptimizationResults', 'U') IS NOT NULL
             INSERT INTO #AllTables SELECT DISTINCT DatabaseName, SchemaName, TableName
-            FROM indexing.IndexOptimizationResults WHERE ResolvedDate IS NULL;
+            FROM optimize.IndexOptimizationResults WHERE ResolvedDate IS NULL;
 
-        IF @RunKeyLookup = 1 AND OBJECT_ID('indexing.KeyLookupResults', 'U') IS NOT NULL
+        IF @RunKeyLookup = 1 AND OBJECT_ID('optimize.KeyLookupResults', 'U') IS NOT NULL
             INSERT INTO #AllTables SELECT DISTINCT DatabaseName, SchemaName, TableName
-            FROM indexing.KeyLookupResults WHERE ResolvedDate IS NULL;
+            FROM optimize.KeyLookupResults WHERE ResolvedDate IS NULL;
 
-        IF @RunUnusedIndex = 1 AND OBJECT_ID('indexing.UnusedIndexResults', 'U') IS NOT NULL
+        IF @RunUnusedIndex = 1 AND OBJECT_ID('optimize.UnusedIndexResults', 'U') IS NOT NULL
             INSERT INTO #AllTables SELECT DISTINCT DatabaseName, SchemaName, TableName
-            FROM indexing.UnusedIndexResults WHERE ResolvedDate IS NULL
+            FROM optimize.UnusedIndexResults WHERE ResolvedDate IS NULL
               AND UserUpdates >= @MinUpdateCount AND ObservationDays >= @MinObservDays
               AND CASE Confidence WHEN 'HIGH' THEN 3 WHEN 'MEDIUM' THEN 2 WHEN 'LOW' THEN 1 ELSE 0 END
                   >= CASE @Confidence WHEN 'HIGH' THEN 3 WHEN 'MEDIUM' THEN 2 WHEN 'LOW' THEN 1 ELSE 0 END;
 
-        IF @RunOptimizeIndex = 1 AND OBJECT_ID('indexing.MissingIndexResults', 'U') IS NOT NULL
+        IF @RunOptimizeIndex = 1 AND OBJECT_ID('optimize.MissingIndexResults', 'U') IS NOT NULL
             INSERT INTO #AllTables SELECT DISTINCT DatabaseName, SchemaName, TableName
-            FROM indexing.MissingIndexResults
+            FROM optimize.MissingIndexResults
             WHERE ResolvedDate IS NULL AND ServerName = @@SERVERNAME
               AND Strategy NOT IN ('SUPERSET_COVERED');
 
-        IF @RunExpensiveQuery = 1 AND OBJECT_ID('indexing.ExpensiveQueryResults', 'U') IS NOT NULL
+        IF @RunExpensiveQuery = 1 AND OBJECT_ID('optimize.ExpensiveQueryResults', 'U') IS NOT NULL
             INSERT INTO #AllTables SELECT DISTINCT DatabaseName, SchemaName, TableName
-            FROM indexing.ExpensiveQueryResults WHERE ResolvedDate IS NULL AND FindingType = 'MISSING_INDEX';
+            FROM optimize.ExpensiveQueryResults WHERE ResolvedDate IS NULL AND FindingType = 'MISSING_INDEX';
 
         -- Column Access: build consolidated recommendations first
         DROP TABLE IF EXISTS #CATableRecs;
@@ -11751,7 +11780,7 @@ BEGIN
             CreateStatement NVARCHAR(MAX), EstimatedSizeGB DECIMAL(18,2),
             NearMatchIndex NVARCHAR(256), NearMatchAction VARCHAR(20));
 
-        IF @RunColumnAccess = 1 AND OBJECT_ID('indexing.ColumnAccessPatternResults', 'U') IS NOT NULL
+        IF @RunColumnAccess = 1 AND OBJECT_ID('optimize.ColumnAccessPatternResults', 'U') IS NOT NULL
         BEGIN
             ;WITH ColumnsByTable AS (
                 SELECT DatabaseName, SchemaName, TableName, ColumnName, UsageType, QueryCount, TotalLogicalReads
@@ -11759,11 +11788,11 @@ BEGIN
                     ORDER BY CASE UsageType WHEN 'EQUALITY' THEN 1 WHEN 'SEEK_PREDICATE' THEN 2
                       WHEN 'INEQUALITY' THEN 3 WHEN 'SCAN_PREDICATE' THEN 4 ELSE 99 END,
                       QueryCount DESC, TotalLogicalReads DESC) AS key_order
-                FROM indexing.ColumnAccessPatternResults
+                FROM optimize.ColumnAccessPatternResults
                 WHERE ResolvedDate IS NULL
                   AND UsageType IN ('EQUALITY','INEQUALITY','SEEK_PREDICATE','SCAN_PREDICATE')
                   AND (ExistingIndexCoverage IS NULL OR ExistingIndexCoverage <> 'LEADING_KEY')
-                  AND DatabaseName IN (SELECT DatabaseName FROM #AllTables UNION SELECT DatabaseName FROM indexing.ColumnAccessPatternResults WHERE ResolvedDate IS NULL)
+                  AND DatabaseName IN (SELECT DatabaseName FROM #AllTables UNION SELECT DatabaseName FROM optimize.ColumnAccessPatternResults WHERE ResolvedDate IS NULL)
                   AND EXISTS (SELECT 1 FROM sys.databases WHERE name = DatabaseName)
             )
             INSERT INTO #CATableRecs (DatabaseName, SchemaName, TableName, KeyColumns, IncludeColumns)
@@ -11771,7 +11800,7 @@ BEGIN
               ,STUFF((SELECT ', [' + c2.ColumnName + ']' FROM ColumnsByTable c2
                 WHERE c2.DatabaseName = c.DatabaseName AND c2.SchemaName = c.SchemaName AND c2.TableName = c.TableName
                 ORDER BY c2.key_order FOR XML PATH(''), TYPE).value('.', 'NVARCHAR(MAX)'), 1, 2, '')
-              ,STUFF((SELECT ', [' + i2.ColumnName + ']' FROM indexing.ColumnAccessPatternResults i2
+              ,STUFF((SELECT ', [' + i2.ColumnName + ']' FROM optimize.ColumnAccessPatternResults i2
                 WHERE i2.DatabaseName = c.DatabaseName AND i2.SchemaName = c.SchemaName AND i2.TableName = c.TableName
                   AND i2.ResolvedDate IS NULL AND i2.UsageType = 'INCLUDE'
                   AND (i2.ExistingIndexCoverage IS NULL OR i2.ExistingIndexCoverage <> 'LEADING_KEY')
@@ -11836,36 +11865,31 @@ BEGIN
         DELETE FROM D WHERE rn > 1;
 
         -- Filter to target databases
-        IF @DatabaseName IS NOT NULL
-        BEGIN
-            IF @DatabaseName LIKE '%[%]%'
-                DELETE FROM #AllTables WHERE DatabaseName NOT LIKE @DatabaseName;
-            ELSE
-                DELETE FROM #AllTables WHERE DatabaseName NOT IN (SELECT LTRIM(RTRIM(value)) FROM STRING_SPLIT(@DatabaseName, ','));
-        END
+        DELETE FROM #AllTables
+        WHERE DatabaseName NOT IN (SELECT DatabaseName FROM optimize.fn_GetDatabases(@Databases));
 
         -- Per-tool finding counts
         DECLARE @hdrDup VARCHAR(50) = '', @hdrKey VARCHAR(50) = '', @hdrUnused VARCHAR(50) = '',
                 @hdrMissing VARCHAR(50) = '', @hdrExpensive VARCHAR(50) = '', @hdrColumn VARCHAR(50) = '';
         DECLARE @hdrCount INT;
 
-        IF @RunDuplicateIndex = 1 AND OBJECT_ID('indexing.IndexOptimizationResults', 'U') IS NOT NULL
+        IF @RunDuplicateIndex = 1 AND OBJECT_ID('optimize.IndexOptimizationResults', 'U') IS NOT NULL
         BEGIN
-            SELECT @hdrCount = COUNT(*) FROM indexing.IndexOptimizationResults
+            SELECT @hdrCount = COUNT(*) FROM optimize.IndexOptimizationResults
             WHERE ResolvedDate IS NULL AND DatabaseName IN (SELECT DatabaseName FROM #AllTables);
             SET @hdrDup = '  Duplicate Index:       ' + CAST(@hdrCount AS VARCHAR(10)) + ' findings' + @CRLF2;
         END
 
-        IF @RunKeyLookup = 1 AND OBJECT_ID('indexing.KeyLookupResults', 'U') IS NOT NULL
+        IF @RunKeyLookup = 1 AND OBJECT_ID('optimize.KeyLookupResults', 'U') IS NOT NULL
         BEGIN
-            SELECT @hdrCount = COUNT(*) FROM indexing.KeyLookupResults
+            SELECT @hdrCount = COUNT(*) FROM optimize.KeyLookupResults
             WHERE ResolvedDate IS NULL AND DatabaseName IN (SELECT DatabaseName FROM #AllTables);
             SET @hdrKey = '  Key Lookup:            ' + CAST(@hdrCount AS VARCHAR(10)) + ' findings' + @CRLF2;
         END
 
-        IF @RunUnusedIndex = 1 AND OBJECT_ID('indexing.UnusedIndexResults', 'U') IS NOT NULL
+        IF @RunUnusedIndex = 1 AND OBJECT_ID('optimize.UnusedIndexResults', 'U') IS NOT NULL
         BEGIN
-            SELECT @hdrCount = COUNT(*) FROM indexing.UnusedIndexResults
+            SELECT @hdrCount = COUNT(*) FROM optimize.UnusedIndexResults
             WHERE ResolvedDate IS NULL AND DatabaseName IN (SELECT DatabaseName FROM #AllTables)
                 AND UserUpdates >= @MinUpdateCount AND ObservationDays >= @MinObservDays
                 AND CASE Confidence WHEN 'HIGH' THEN 3 WHEN 'MEDIUM' THEN 2 WHEN 'LOW' THEN 1 ELSE 0 END
@@ -11873,17 +11897,17 @@ BEGIN
             SET @hdrUnused = '  Unused Index:          ' + CAST(@hdrCount AS VARCHAR(10)) + ' findings' + @CRLF2;
         END
 
-        IF @RunOptimizeIndex = 1 AND OBJECT_ID('indexing.MissingIndexResults', 'U') IS NOT NULL
+        IF @RunOptimizeIndex = 1 AND OBJECT_ID('optimize.MissingIndexResults', 'U') IS NOT NULL
         BEGIN
-            SELECT @hdrCount = COUNT(*) FROM indexing.MissingIndexResults
+            SELECT @hdrCount = COUNT(*) FROM optimize.MissingIndexResults
             WHERE ResolvedDate IS NULL AND ServerName = @@SERVERNAME AND Strategy NOT IN ('SUPERSET_COVERED')
                 AND DatabaseName IN (SELECT DatabaseName FROM #AllTables);
             SET @hdrMissing = '  Missing Index:         ' + CAST(@hdrCount AS VARCHAR(10)) + ' findings' + @CRLF2;
         END
 
-        IF @RunExpensiveQuery = 1 AND OBJECT_ID('indexing.ExpensiveQueryResults', 'U') IS NOT NULL
+        IF @RunExpensiveQuery = 1 AND OBJECT_ID('optimize.ExpensiveQueryResults', 'U') IS NOT NULL
         BEGIN
-            SELECT @hdrCount = COUNT(*) FROM indexing.ExpensiveQueryResults
+            SELECT @hdrCount = COUNT(*) FROM optimize.ExpensiveQueryResults
             WHERE ResolvedDate IS NULL AND DatabaseName IN (SELECT DatabaseName FROM #AllTables);
             SET @hdrExpensive = '  Expensive Query:       ' + CAST(@hdrCount AS VARCHAR(10)) + ' findings' + @CRLF2;
         END
@@ -11963,7 +11987,7 @@ BEGIN
             ---------------------------------------------------------------
             -- Duplicate Index findings for this table
             ---------------------------------------------------------------
-            IF @RunDuplicateIndex = 1 AND OBJECT_ID('indexing.IndexOptimizationResults', 'U') IS NOT NULL
+            IF @RunDuplicateIndex = 1 AND OBJECT_ID('optimize.IndexOptimizationResults', 'U') IS NOT NULL
             BEGIN
                 SET @cSection = NULL;
 
@@ -11982,7 +12006,7 @@ BEGIN
                            Index2Name, Index2Id, Index2Keys, Index2Includes, Index2SizeKB, Index2UserSeeks, Index2UserScans,
                            NewIndexName, NewIndexKeys, NewIncludeColumns, NewIndexNameExists,
                            CreateStatement, DropStatement1, DropStatement2, EstimatedSizeGB
-                    FROM indexing.IndexOptimizationResults
+                    FROM optimize.IndexOptimizationResults
                     WHERE ResolvedDate IS NULL
                       AND DatabaseName = @cDB AND SchemaName = @cSchema AND TableName = @cTable
                     ORDER BY CASE ActionType
@@ -12020,7 +12044,7 @@ BEGIN
                             + @CRLF2
                             + @dDrop1 + @CRLF2
                             + @CRLF2
-                            + 'UPDATE DBA_Utilities.indexing.IndexOptimizationResults SET ResolvedDate = GETDATE() WHERE IndexOptimizationId = ' + CAST(@dId AS VARCHAR(10)) + ';' + @CRLF2;
+                            + 'UPDATE DBA_Utilities.optimize.IndexOptimizationResults SET ResolvedDate = GETDATE() WHERE IndexOptimizationId = ' + CAST(@dId AS VARCHAR(10)) + ';' + @CRLF2;
                     ELSE
                     BEGIN
                         SET @cSection = @cSection
@@ -12075,10 +12099,10 @@ BEGIN
 
                         IF @dShouldComment = 1
                             SET @cSection = @cSection
-                                + '/* UPDATE DBA_Utilities.indexing.IndexOptimizationResults SET ResolvedDate = GETDATE() WHERE IndexOptimizationId = ' + CAST(@dId AS VARCHAR(10)) + '; */' + @CRLF2;
+                                + '/* UPDATE DBA_Utilities.optimize.IndexOptimizationResults SET ResolvedDate = GETDATE() WHERE IndexOptimizationId = ' + CAST(@dId AS VARCHAR(10)) + '; */' + @CRLF2;
                         ELSE
                             SET @cSection = @cSection
-                                + 'UPDATE DBA_Utilities.indexing.IndexOptimizationResults SET ResolvedDate = GETDATE() WHERE IndexOptimizationId = ' + CAST(@dId AS VARCHAR(10)) + ';' + @CRLF2;
+                                + 'UPDATE DBA_Utilities.optimize.IndexOptimizationResults SET ResolvedDate = GETDATE() WHERE IndexOptimizationId = ' + CAST(@dId AS VARCHAR(10)) + ';' + @CRLF2;
                     END
 
                     FETCH NEXT FROM dup_cursor INTO @dId, @dAction,
@@ -12096,7 +12120,7 @@ BEGIN
 
                     INSERT INTO #ModifiedIndexes (DatabaseName, SchemaName, TableName, IndexName, ToolName)
                     SELECT DatabaseName, SchemaName, TableName, Index1Name, 'Duplicate Index'
-                    FROM indexing.IndexOptimizationResults
+                    FROM optimize.IndexOptimizationResults
                     WHERE ResolvedDate IS NULL AND DatabaseName = @cDB AND SchemaName = @cSchema AND TableName = @cTable;
                 END
             END
@@ -12104,7 +12128,7 @@ BEGIN
             ---------------------------------------------------------------
             -- Key Lookup findings for this table
             ---------------------------------------------------------------
-            IF @RunKeyLookup = 1 AND OBJECT_ID('indexing.KeyLookupResults', 'U') IS NOT NULL
+            IF @RunKeyLookup = 1 AND OBJECT_ID('optimize.KeyLookupResults', 'U') IS NOT NULL
             BEGIN
                 SET @cSection = NULL;
                 SELECT @cSection = ISNULL(@cSection + @CRLF2, '')
@@ -12140,10 +12164,10 @@ BEGIN
                     END
                     + CASE WHEN @ActiveThreshold IS NOT NULL
                           AND (ISNULL(EstimatedSizeGB, 0) >= @ActiveThreshold OR (EstimatedSizeGB IS NULL AND ISNULL(NCIndexSizeKB, 0) >= CAST(@ActiveThreshold * 1048576 AS BIGINT)))
-                        THEN '/* UPDATE DBA_Utilities.indexing.KeyLookupResults SET ResolvedDate = GETDATE() WHERE KeyLookupId = ' + CAST(KeyLookupId AS VARCHAR(10)) + '; */' + @CRLF2
-                        ELSE 'UPDATE DBA_Utilities.indexing.KeyLookupResults SET ResolvedDate = GETDATE() WHERE KeyLookupId = ' + CAST(KeyLookupId AS VARCHAR(10)) + ';' + @CRLF2
+                        THEN '/* UPDATE DBA_Utilities.optimize.KeyLookupResults SET ResolvedDate = GETDATE() WHERE KeyLookupId = ' + CAST(KeyLookupId AS VARCHAR(10)) + '; */' + @CRLF2
+                        ELSE 'UPDATE DBA_Utilities.optimize.KeyLookupResults SET ResolvedDate = GETDATE() WHERE KeyLookupId = ' + CAST(KeyLookupId AS VARCHAR(10)) + ';' + @CRLF2
                     END
-                FROM indexing.KeyLookupResults
+                FROM optimize.KeyLookupResults
                 WHERE ResolvedDate IS NULL
                   AND DatabaseName = @cDB AND SchemaName = @cSchema AND TableName = @cTable
                 ORDER BY TotalLogicalReads DESC;
@@ -12154,7 +12178,7 @@ BEGIN
 
                     INSERT INTO #ModifiedIndexes (DatabaseName, SchemaName, TableName, IndexName, ToolName)
                     SELECT DatabaseName, SchemaName, TableName, NCIndexName, 'Key Lookup'
-                    FROM indexing.KeyLookupResults
+                    FROM optimize.KeyLookupResults
                     WHERE ResolvedDate IS NULL AND DatabaseName = @cDB AND SchemaName = @cSchema AND TableName = @cTable;
                 END
             END
@@ -12162,7 +12186,7 @@ BEGIN
             ---------------------------------------------------------------
             -- Unused Index findings for this table
             ---------------------------------------------------------------
-            IF @RunUnusedIndex = 1 AND OBJECT_ID('indexing.UnusedIndexResults', 'U') IS NOT NULL
+            IF @RunUnusedIndex = 1 AND OBJECT_ID('optimize.UnusedIndexResults', 'U') IS NOT NULL
             BEGIN
                 SET @cSection = NULL;
                 SELECT @cSection = ISNULL(@cSection + @CRLF2, '')
@@ -12180,8 +12204,8 @@ BEGIN
                     + @CRLF2
                     + ISNULL(DropStatement, '') + @CRLF2
                     + @CRLF2
-                    + 'UPDATE DBA_Utilities.indexing.UnusedIndexResults SET ResolvedDate = GETDATE() WHERE UnusedIndexId = ' + CAST(UnusedIndexId AS VARCHAR(10)) + ';' + @CRLF2
-                FROM indexing.UnusedIndexResults
+                    + 'UPDATE DBA_Utilities.optimize.UnusedIndexResults SET ResolvedDate = GETDATE() WHERE UnusedIndexId = ' + CAST(UnusedIndexId AS VARCHAR(10)) + ';' + @CRLF2
+                FROM optimize.UnusedIndexResults
                 WHERE ResolvedDate IS NULL
                   AND DatabaseName = @cDB AND SchemaName = @cSchema AND TableName = @cTable
                   AND UserUpdates >= @MinUpdateCount AND ObservationDays >= @MinObservDays
@@ -12196,7 +12220,7 @@ BEGIN
             ---------------------------------------------------------------
             -- Missing Index (optimize-index) findings for this table
             ---------------------------------------------------------------
-            IF @RunOptimizeIndex = 1 AND OBJECT_ID('indexing.MissingIndexResults', 'U') IS NOT NULL
+            IF @RunOptimizeIndex = 1 AND OBJECT_ID('optimize.MissingIndexResults', 'U') IS NOT NULL
             BEGIN
                 SET @cSection = NULL;
 
@@ -12208,7 +12232,7 @@ BEGIN
                     SELECT MissingIndexId, Strategy, ExistingIndexName, KeyColumns, IncludedColumns,
                            IndexAdvantage, RecommendationCount, EstimatedSizeGB, CreateStatement,
                            IsSuperConsolidated, OriginalGroupCount
-                    FROM indexing.MissingIndexResults
+                    FROM optimize.MissingIndexResults
                     WHERE ResolvedDate IS NULL AND ServerName = @@SERVERNAME
                       AND DatabaseName = @cDB AND SchemaName = @cSchema AND TableName = @cTable
                       AND Strategy NOT IN ('SUPERSET_COVERED')
@@ -12245,10 +12269,10 @@ BEGIN
                             + '-- Covered above by ' + @coveredBy + @CRLF2 + @CRLF2;
                         IF @ActiveThreshold IS NOT NULL AND ISNULL(@mEstGB, 0) >= @ActiveThreshold
                             SET @cSection = @cSection
-                                + '/* UPDATE DBA_Utilities.indexing.MissingIndexResults SET ResolvedDate = GETDATE() WHERE MissingIndexId = ' + CAST(@mId AS VARCHAR(10)) + '; */' + @CRLF2;
+                                + '/* UPDATE DBA_Utilities.optimize.MissingIndexResults SET ResolvedDate = GETDATE() WHERE MissingIndexId = ' + CAST(@mId AS VARCHAR(10)) + '; */' + @CRLF2;
                         ELSE
                             SET @cSection = @cSection
-                                + 'UPDATE DBA_Utilities.indexing.MissingIndexResults SET ResolvedDate = GETDATE() WHERE MissingIndexId = ' + CAST(@mId AS VARCHAR(10)) + ';' + @CRLF2;
+                                + 'UPDATE DBA_Utilities.optimize.MissingIndexResults SET ResolvedDate = GETDATE() WHERE MissingIndexId = ' + CAST(@mId AS VARCHAR(10)) + ';' + @CRLF2;
                     END
                     ELSE IF @ActiveThreshold IS NOT NULL AND ISNULL(@mEstGB, 0) >= @ActiveThreshold
                     BEGIN
@@ -12257,12 +12281,12 @@ BEGIN
                         ELSE
                             SET @cSection = @cSection + ISNULL(@mCreate + @CRLF2 + @CRLF2, '');
                         SET @cSection = @cSection
-                            + '/* UPDATE DBA_Utilities.indexing.MissingIndexResults SET ResolvedDate = GETDATE() WHERE MissingIndexId = ' + CAST(@mId AS VARCHAR(10)) + '; */' + @CRLF2;
+                            + '/* UPDATE DBA_Utilities.optimize.MissingIndexResults SET ResolvedDate = GETDATE() WHERE MissingIndexId = ' + CAST(@mId AS VARCHAR(10)) + '; */' + @CRLF2;
                     END
                     ELSE
                         SET @cSection = @cSection
                             + ISNULL(@mCreate + @CRLF2 + @CRLF2, '')
-                            + 'UPDATE DBA_Utilities.indexing.MissingIndexResults SET ResolvedDate = GETDATE() WHERE MissingIndexId = ' + CAST(@mId AS VARCHAR(10)) + ';' + @CRLF2;
+                            + 'UPDATE DBA_Utilities.optimize.MissingIndexResults SET ResolvedDate = GETDATE() WHERE MissingIndexId = ' + CAST(@mId AS VARCHAR(10)) + ';' + @CRLF2;
 
                     FETCH NEXT FROM mi_cursor INTO @mId, @mStrategy, @mExIdx, @mKeys, @mInc,
                         @mAdvantage, @mRecCount, @mEstGB, @mCreate, @mIsSuperCons, @mOrigGrpCnt;
@@ -12282,7 +12306,7 @@ BEGIN
                             CHARINDEX(']', CreateStatement, CHARINDEX('CREATE NONCLUSTERED INDEX [', CreateStatement) + 27)
                             - CHARINDEX('CREATE NONCLUSTERED INDEX [', CreateStatement) - 27),
                         'Missing Index'
-                    FROM indexing.MissingIndexResults
+                    FROM optimize.MissingIndexResults
                     WHERE ResolvedDate IS NULL AND ServerName = @@SERVERNAME
                       AND DatabaseName = @cDB AND SchemaName = @cSchema AND TableName = @cTable
                       AND Strategy NOT IN ('SUPERSET_COVERED')
@@ -12294,7 +12318,7 @@ BEGIN
             ---------------------------------------------------------------
             -- Expensive Query findings for this table
             ---------------------------------------------------------------
-            IF @RunExpensiveQuery = 1 AND OBJECT_ID('indexing.ExpensiveQueryResults', 'U') IS NOT NULL
+            IF @RunExpensiveQuery = 1 AND OBJECT_ID('optimize.ExpensiveQueryResults', 'U') IS NOT NULL
             BEGIN
                 SET @cSection = NULL;
                 SELECT @cSection = ISNULL(@cSection + @CRLF2, '')
@@ -12334,10 +12358,10 @@ BEGIN
                           END
                     END
                     + CASE WHEN @ActiveThreshold IS NOT NULL AND ISNULL(EstimatedSizeGB, 0) >= @ActiveThreshold
-                        THEN '/* UPDATE DBA_Utilities.indexing.ExpensiveQueryResults SET ResolvedDate = GETDATE() WHERE ExpensiveQueryId = ' + CAST(ExpensiveQueryId AS VARCHAR(10)) + '; */' + @CRLF2
-                        ELSE 'UPDATE DBA_Utilities.indexing.ExpensiveQueryResults SET ResolvedDate = GETDATE() WHERE ExpensiveQueryId = ' + CAST(ExpensiveQueryId AS VARCHAR(10)) + ';' + @CRLF2
+                        THEN '/* UPDATE DBA_Utilities.optimize.ExpensiveQueryResults SET ResolvedDate = GETDATE() WHERE ExpensiveQueryId = ' + CAST(ExpensiveQueryId AS VARCHAR(10)) + '; */' + @CRLF2
+                        ELSE 'UPDATE DBA_Utilities.optimize.ExpensiveQueryResults SET ResolvedDate = GETDATE() WHERE ExpensiveQueryId = ' + CAST(ExpensiveQueryId AS VARCHAR(10)) + ';' + @CRLF2
                     END
-                FROM indexing.ExpensiveQueryResults
+                FROM optimize.ExpensiveQueryResults
                 WHERE ResolvedDate IS NULL
                   AND DatabaseName = @cDB AND SchemaName = @cSchema AND TableName = @cTable
                 ORDER BY TotalLogicalReads DESC;
@@ -12353,7 +12377,7 @@ BEGIN
                             CHARINDEX(']', CreateStatement, CHARINDEX('CREATE NONCLUSTERED INDEX [', CreateStatement) + 27)
                             - CHARINDEX('CREATE NONCLUSTERED INDEX [', CreateStatement) - 27),
                         'Expensive Query'
-                    FROM indexing.ExpensiveQueryResults
+                    FROM optimize.ExpensiveQueryResults
                     WHERE ResolvedDate IS NULL AND DatabaseName = @cDB AND SchemaName = @cSchema AND TableName = @cTable
                       AND CreateStatement IS NOT NULL
                       AND CHARINDEX('CREATE NONCLUSTERED INDEX [', CreateStatement) > 0;
@@ -12405,7 +12429,7 @@ BEGIN
 
                     SET @caIds = NULL;
                     SELECT @caIds = STRING_AGG(CAST(ColumnAccessPatternId AS VARCHAR(10)), ',')
-                    FROM indexing.ColumnAccessPatternResults
+                    FROM optimize.ColumnAccessPatternResults
                     WHERE ResolvedDate IS NULL
                       AND DatabaseName = @cDB AND SchemaName = @cSchema AND TableName = @cTable;
 
@@ -12413,10 +12437,10 @@ BEGIN
                     BEGIN
                         IF @coveredBy IS NOT NULL AND @ActiveThreshold IS NOT NULL AND ISNULL(@caEstGB, 0) >= @ActiveThreshold
                             SET @cSection = @cSection + @CRLF2
-                                + '/* UPDATE DBA_Utilities.indexing.ColumnAccessPatternResults SET ResolvedDate = GETDATE() WHERE ColumnAccessPatternId IN (' + @caIds + '); */' + @CRLF2;
+                                + '/* UPDATE DBA_Utilities.optimize.ColumnAccessPatternResults SET ResolvedDate = GETDATE() WHERE ColumnAccessPatternId IN (' + @caIds + '); */' + @CRLF2;
                         ELSE
                             SET @cSection = @cSection + @CRLF2
-                                + 'UPDATE DBA_Utilities.indexing.ColumnAccessPatternResults SET ResolvedDate = GETDATE() WHERE ColumnAccessPatternId IN (' + @caIds + ');' + @CRLF2;
+                                + 'UPDATE DBA_Utilities.optimize.ColumnAccessPatternResults SET ResolvedDate = GETDATE() WHERE ColumnAccessPatternId IN (' + @caIds + ');' + @CRLF2;
                     END
 
                     SET @Out = @Out + @CRLF2 + '-- === COLUMN ACCESS ===' + @CRLF2 + @cSection;
@@ -12433,41 +12457,41 @@ BEGIN
         IF @ActiveThreshold IS NOT NULL
         BEGIN
             -- Duplicate Index: REDUNDANT/DUPLICATE always runnable (DROPs), COMBINE runnable if below threshold
-            IF @RunDuplicateIndex = 1 AND OBJECT_ID('indexing.IndexOptimizationResults', 'U') IS NOT NULL
+            IF @RunDuplicateIndex = 1 AND OBJECT_ID('optimize.IndexOptimizationResults', 'U') IS NOT NULL
                 SELECT @CombinedRunnableCount = @CombinedRunnableCount + COUNT(*)
-                FROM indexing.IndexOptimizationResults
+                FROM optimize.IndexOptimizationResults
                 WHERE ResolvedDate IS NULL AND DatabaseName IN (SELECT DatabaseName FROM #AllTables)
                   AND (ActionType <> 'COMBINE' OR ISNULL(EstimatedSizeGB, 0) < @ActiveThreshold);
 
             -- Key Lookup: runnable if estimated size below threshold
-            IF @RunKeyLookup = 1 AND OBJECT_ID('indexing.KeyLookupResults', 'U') IS NOT NULL
+            IF @RunKeyLookup = 1 AND OBJECT_ID('optimize.KeyLookupResults', 'U') IS NOT NULL
                 SELECT @CombinedRunnableCount = @CombinedRunnableCount + COUNT(*)
-                FROM indexing.KeyLookupResults
+                FROM optimize.KeyLookupResults
                 WHERE ResolvedDate IS NULL AND DatabaseName IN (SELECT DatabaseName FROM #AllTables)
                   AND (ISNULL(EstimatedSizeGB, 0) < @ActiveThreshold OR (EstimatedSizeGB IS NULL AND ISNULL(NCIndexSizeKB, 0) < CAST(@ActiveThreshold * 1048576 AS BIGINT)));
 
             -- Unused Index: always runnable (DISABLE/DROP)
-            IF @RunUnusedIndex = 1 AND OBJECT_ID('indexing.UnusedIndexResults', 'U') IS NOT NULL
+            IF @RunUnusedIndex = 1 AND OBJECT_ID('optimize.UnusedIndexResults', 'U') IS NOT NULL
                 SELECT @CombinedRunnableCount = @CombinedRunnableCount + COUNT(*)
-                FROM indexing.UnusedIndexResults
+                FROM optimize.UnusedIndexResults
                 WHERE ResolvedDate IS NULL AND DatabaseName IN (SELECT DatabaseName FROM #AllTables)
                   AND UserUpdates >= @MinUpdateCount AND ObservationDays >= @MinObservDays
                   AND CASE Confidence WHEN 'HIGH' THEN 3 WHEN 'MEDIUM' THEN 2 WHEN 'LOW' THEN 1 ELSE 0 END
                       >= CASE @Confidence WHEN 'HIGH' THEN 3 WHEN 'MEDIUM' THEN 2 WHEN 'LOW' THEN 1 ELSE 0 END;
 
             -- Missing Index: runnable if below threshold
-            IF @RunOptimizeIndex = 1 AND OBJECT_ID('indexing.MissingIndexResults', 'U') IS NOT NULL
+            IF @RunOptimizeIndex = 1 AND OBJECT_ID('optimize.MissingIndexResults', 'U') IS NOT NULL
                 SELECT @CombinedRunnableCount = @CombinedRunnableCount + COUNT(*)
-                FROM indexing.MissingIndexResults
+                FROM optimize.MissingIndexResults
                 WHERE ResolvedDate IS NULL AND ServerName = @@SERVERNAME
                   AND Strategy NOT IN ('SUPERSET_COVERED')
                   AND DatabaseName IN (SELECT DatabaseName FROM #AllTables)
                   AND ISNULL(EstimatedSizeGB, 0) < @ActiveThreshold;
 
             -- Expensive Query: runnable if below threshold
-            IF @RunExpensiveQuery = 1 AND OBJECT_ID('indexing.ExpensiveQueryResults', 'U') IS NOT NULL
+            IF @RunExpensiveQuery = 1 AND OBJECT_ID('optimize.ExpensiveQueryResults', 'U') IS NOT NULL
                 SELECT @CombinedRunnableCount = @CombinedRunnableCount + COUNT(*)
-                FROM indexing.ExpensiveQueryResults
+                FROM optimize.ExpensiveQueryResults
                 WHERE ResolvedDate IS NULL AND DatabaseName IN (SELECT DatabaseName FROM #AllTables)
                   AND ISNULL(EstimatedSizeGB, 0) < @ActiveThreshold;
 
@@ -12636,7 +12660,7 @@ BEGIN
         -- Return combined output as single row
         SELECT
             @@SERVERNAME AS ServerName,
-            ISNULL(@DatabaseName, 'ALL') AS DatabaseName,
+            ISNULL(@Databases, 'USER_DATABASES') AS DatabaseName,
             GETDATE() AS GeneratedDate,
             CAST((SELECT COUNT(DISTINCT DatabaseName) FROM #AllTables) AS VARCHAR(10)) + ' databases, '
                 + CAST((SELECT COUNT(*) FROM #AllTables) AS VARCHAR(10)) + ' tables' AS [Statistics],

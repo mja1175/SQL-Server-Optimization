@@ -1,17 +1,24 @@
+/*
+    SQL Server Optimization Suite
+    Default Database: DBA_Utilities
+
+    To install in a different database, find and replace all instances of
+    "DBA_Utilities" with your database name before running this script.
+*/
 USE DBA_Utilities;
 GO
 
 -- ==========================================================================
--- Table: indexing.IndexMaintenanceHistory
+-- Table: optimize.IndexMaintenanceHistory
 -- ==========================================================================
 
-IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = 'indexing')
-    EXEC('CREATE SCHEMA indexing');
+IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = 'optimize')
+    EXEC('CREATE SCHEMA optimize');
 GO
 
-IF OBJECT_ID('indexing.IndexMaintenanceHistory', 'U') IS NULL
+IF OBJECT_ID('optimize.IndexMaintenanceHistory', 'U') IS NULL
 BEGIN
-    CREATE TABLE indexing.IndexMaintenanceHistory (
+    CREATE TABLE optimize.IndexMaintenanceHistory (
         Id              BIGINT IDENTITY(1,1) NOT NULL,
         RunId           INT              NOT NULL,
         ServerName      NVARCHAR(128)    NOT NULL CONSTRAINT DF_IMH_ServerName DEFAULT @@SERVERNAME,
@@ -39,11 +46,11 @@ END
 GO
 
 -- ==========================================================================
--- Proc: indexing.sp_IndexMaintenance
+-- Proc: optimize.sp_IndexMaintenance
 -- ==========================================================================
 
-CREATE OR ALTER PROCEDURE indexing.sp_IndexMaintenance
-    @DatabaseName       NVARCHAR(MAX)   = NULL,         -- NULL = all user DBs. Supports CSV list and LIKE wildcards
+CREATE OR ALTER PROCEDURE optimize.sp_IndexMaintenance
+    @Databases          NVARCHAR(MAX)   = NULL,         -- NULL = all user DBs. Supports Ola Hallengren-style syntax
     @TableName          NVARCHAR(MAX)   = NULL,         -- NULL = all tables. CSV with optional schema prefix (dbo.MyTable)
     @ReorgThreshold     DECIMAL(5,2)    = 10.0,         -- reorganize at or above this fragmentation %
     @RebuildThreshold   DECIMAL(5,2)    = NULL,         -- NULL = auto (Enterprise: 10%, Standard: 30%)
@@ -76,9 +83,9 @@ BEGIN
     -- Run tracking
     ---------------------------------------------------------------------------
     DECLARE @RunId INT;
-    SELECT @RunId = ISNULL(MAX(RunId), 0) + 1 FROM indexing.IndexMaintenanceHistory;
+    SELECT @RunId = ISNULL(MAX(RunId), 0) + 1 FROM optimize.IndexMaintenanceHistory;
 
-    DELETE FROM indexing.IndexMaintenanceHistory WHERE CreatedDate < DATEADD(DAY, -90, SYSDATETIME());
+    DELETE FROM optimize.IndexMaintenanceHistory WHERE CreatedDate < DATEADD(DAY, -90, SYSDATETIME());
 
     DECLARE @RunStartTime DATETIME2(3) = SYSDATETIME();
     DECLARE @TimeLimitEnd DATETIME2(3) = CASE
@@ -92,28 +99,10 @@ BEGIN
     ---------------------------------------------------------------------------
     CREATE TABLE #DatabaseList (DatabaseName NVARCHAR(128));
 
-    IF @DatabaseName IS NULL
-    BEGIN
-        INSERT INTO #DatabaseList (DatabaseName)
-        SELECT d.name FROM sys.databases d
-        WHERE d.state_desc = 'ONLINE' AND d.database_id > 4 AND d.is_read_only = 0
-        ORDER BY d.name;
-    END
-    ELSE IF @DatabaseName LIKE '%[%]%'
-    BEGIN
-        INSERT INTO #DatabaseList (DatabaseName)
-        SELECT d.name FROM sys.databases d
-        WHERE d.state_desc = 'ONLINE' AND d.name LIKE @DatabaseName AND d.is_read_only = 0
-        ORDER BY d.name;
-    END
-    ELSE
-    BEGIN
-        INSERT INTO #DatabaseList (DatabaseName)
-        SELECT d.name FROM sys.databases d
-        INNER JOIN STRING_SPLIT(@DatabaseName, ',') s ON d.name = LTRIM(RTRIM(s.value))
-        WHERE d.state_desc = 'ONLINE' AND d.is_read_only = 0
-        ORDER BY d.name;
-    END
+    INSERT INTO #DatabaseList (DatabaseName)
+    SELECT f.DatabaseName FROM optimize.fn_GetDatabases(@Databases) f
+    INNER JOIN sys.databases d ON f.DatabaseName = d.name
+    WHERE d.is_read_only = 0;
 
     DECLARE @DBCount INT = (SELECT COUNT(*) FROM #DatabaseList);
 
@@ -260,7 +249,7 @@ BEGIN
             SET @Msg = '  ERROR scanning ' + @DBName + ': ' + ERROR_MESSAGE();
             RAISERROR(@Msg, 10, 1) WITH NOWAIT;
 
-            INSERT INTO indexing.IndexMaintenanceHistory
+            INSERT INTO optimize.IndexMaintenanceHistory
                 (RunId, DatabaseName, SchemaName, TableName, IndexName, IndexType, FragmentationPct, PageCount, SizeMB, Action, ActionReason, Status, ErrorMessage)
             VALUES
                 (@RunId, @DBName, '-', '-', '-', '-', 0, 0, 0, 'SCAN', 'Fragmentation scan failed', 'Failed', ERROR_MESSAGE());
@@ -417,7 +406,7 @@ BEGIN
             -------------------------------------------------------------------
             -- Log to history
             -------------------------------------------------------------------
-            INSERT INTO indexing.IndexMaintenanceHistory
+            INSERT INTO optimize.IndexMaintenanceHistory
                 (RunId, DatabaseName, SchemaName, TableName, IndexName, IndexType, PartitionNumber,
                  FragmentationPct, PageCount, SizeMB, Action, ActionReason, CommandExecuted,
                  StartTime, EndTime, Status, ErrorMessage)
@@ -468,7 +457,7 @@ BEGIN
         BEGIN
             DECLARE @SkippedCount INT;
 
-            INSERT INTO indexing.IndexMaintenanceHistory
+            INSERT INTO optimize.IndexMaintenanceHistory
                 (RunId, DatabaseName, SchemaName, TableName, IndexName, IndexType, PartitionNumber,
                  FragmentationPct, PageCount, SizeMB, Action, ActionReason, Status)
             SELECT
@@ -581,7 +570,7 @@ BEGIN
         h.DurationSeconds                 AS [Seconds],
         h.ActionReason,
         h.ErrorMessage
-    FROM indexing.IndexMaintenanceHistory h
+    FROM optimize.IndexMaintenanceHistory h
     WHERE h.RunId = @RunId
       AND h.SchemaName <> '-'
     ORDER BY h.DatabaseName, h.FragmentationPct DESC;

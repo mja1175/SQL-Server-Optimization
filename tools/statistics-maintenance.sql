@@ -1,3 +1,10 @@
+/*
+    SQL Server Optimization Suite
+    Default Database: DBA_Utilities
+
+    To install in a different database, find and replace all instances of
+    "DBA_Utilities" with your database name before running this script.
+*/
 USE DBA_Utilities;
 GO
 
@@ -47,10 +54,10 @@ GO
 --      - Empty tables (0 rows) are excluded
 --      - Only user tables are included (system tables excluded)
 --
--- Usage: EXEC DBA_Utilities.dbo.sp_StatisticsMaintenance @DatabaseName = 'All', @Run = 0, @StatisticsSample = NULL, @TableName = NULL, @DetailOutput = 0
+-- Usage: EXEC DBA_Utilities.dbo.sp_StatisticsMaintenance @Databases = 'USER_DATABASES', @Run = 0, @StatisticsSample = NULL, @TableName = NULL, @DetailOutput = 0
 
 CREATE OR ALTER PROCEDURE dbo.sp_StatisticsMaintenance
-    @DatabaseName NVARCHAR(MAX) = NULL,   -- NULL = all user databases, or comma-delimited list
+    @Databases NVARCHAR(MAX) = NULL,      -- NULL = USER_DATABASES. Supports Ola Hallengren-style syntax
     @Run BIT = 0,                         -- 0 = display only (default), 1 = execute updates
     @StatisticsSample DECIMAL(5,2) = NULL,-- NULL = no WITH clause (default), 100 = WITH FULLSCAN, 1-99.99 = WITH SAMPLE X PERCENT
     @TableName NVARCHAR(MAX) = NULL,      -- NULL = all tables (default), or comma-separated list e.g. 'Orders' or 'dbo.Orders,sales.Invoices'
@@ -107,7 +114,7 @@ BEGIN
         PRINT '=============================================='
         PRINT 'STALE STATISTICS CHECKER V2'
         PRINT '=============================================='
-        PRINT 'Database: ' + ISNULL(@DatabaseName, 'All user databases')
+        PRINT 'Databases: ' + ISNULL(@Databases, 'USER_DATABASES (default)')
         PRINT 'Run Mode: ' + CASE WHEN @Run = 1 THEN 'EXECUTE UPDATES' ELSE 'DISPLAY ONLY' END
         PRINT 'Sampling: ' + CASE
             WHEN @StatisticsSample IS NULL THEN 'Default (no WITH clause)'
@@ -127,7 +134,7 @@ BEGIN
     ELSE
         SET @WithClause = ' WITH SAMPLE ' + CAST(@StatisticsSample AS VARCHAR(10)) + ' PERCENT';
 
-    -- Get list of databases based on @DatabaseName parameter
+    -- Get list of databases based on @Databases parameter
     CREATE TABLE #DatabaseList (
         DatabaseName NVARCHAR(128),
         Processed BIT DEFAULT 0,
@@ -135,33 +142,8 @@ BEGIN
         ProcessedAt DATETIME NULL
     );
 
-    IF @DatabaseName IS NULL
-    BEGIN
-        INSERT INTO #DatabaseList (DatabaseName)
-        SELECT d.name
-        FROM sys.databases d
-        WHERE d.state_desc = 'ONLINE'
-          AND d.database_id > 4
-        ORDER BY d.name;
-    END
-    ELSE IF @DatabaseName LIKE '%[%]%'
-    BEGIN
-        INSERT INTO #DatabaseList (DatabaseName)
-        SELECT d.name
-        FROM sys.databases d
-        WHERE d.state_desc = 'ONLINE'
-          AND d.name LIKE @DatabaseName
-        ORDER BY d.name;
-    END
-    ELSE
-    BEGIN
-        INSERT INTO #DatabaseList (DatabaseName)
-        SELECT d.name
-        FROM sys.databases d
-        INNER JOIN STRING_SPLIT(@DatabaseName, ',') s ON d.name = LTRIM(RTRIM(s.value))
-        WHERE d.state_desc = 'ONLINE'
-        ORDER BY d.name;
-    END
+    INSERT INTO #DatabaseList (DatabaseName)
+    SELECT DatabaseName FROM optimize.fn_GetDatabases(@Databases);
 
     DECLARE @ExpectedDBCount INT = (SELECT COUNT(*) FROM #DatabaseList);
     DECLARE @TotalStatsCount INT = 0;

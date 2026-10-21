@@ -11046,7 +11046,7 @@ BEGIN
     ---------------------------------------------------------------------------
     -- 8. Statistics Update
     ---------------------------------------------------------------------------
-    IF OBJECT_ID('dbo.StatisticsUpdate', 'U') IS NOT NULL
+    IF OBJECT_ID('optimize.StatisticsMaintenanceHistory', 'U') IS NOT NULL
     BEGIN
         INSERT INTO #Summary (SortOrder, Tool, Resolved, Databases, Tables, Runs, Detail)
         SELECT
@@ -11061,7 +11061,7 @@ BEGIN
             + CAST(COUNT(DISTINCT Run) AS VARCHAR(10)) + ' runs'
             + ', avg staleness ' + CAST(CAST(AVG(CAST(ISNULL(DaysSinceUpdate, 0) AS FLOAT)) AS INT) AS VARCHAR(10)) + ' days'
             + ', ' + FORMAT(SUM(ISNULL(Modifications, 0)), 'N0') + ' total modifications'
-        FROM dbo.StatisticsUpdate
+        FROM optimize.StatisticsMaintenanceHistory
         WHERE UpdateDate >= @Since
           AND DatabaseName IN (SELECT DatabaseName FROM optimize.fn_GetDatabases(@Databases));
     END
@@ -11268,9 +11268,9 @@ BEGIN
         END
 
         -- 7. Statistics Update Detail
-        IF OBJECT_ID('dbo.StatisticsUpdate', 'U') IS NOT NULL
+        IF OBJECT_ID('optimize.StatisticsMaintenanceHistory', 'U') IS NOT NULL
         BEGIN
-            IF EXISTS (SELECT 1 FROM dbo.StatisticsUpdate
+            IF EXISTS (SELECT 1 FROM optimize.StatisticsMaintenanceHistory
                         WHERE UpdateDate >= @Since
                           AND DatabaseName IN (SELECT DatabaseName FROM optimize.fn_GetDatabases(@Databases)))
             BEGIN
@@ -11284,7 +11284,7 @@ BEGIN
                     DaysSinceUpdate AS StaleDays,
                     FORMAT(Modifications, 'N0') AS Modifications,
                     Outcome
-                FROM dbo.StatisticsUpdate
+                FROM optimize.StatisticsMaintenanceHistory
                 WHERE UpdateDate >= @Since
                   AND DatabaseName IN (SELECT DatabaseName FROM optimize.fn_GetDatabases(@Databases))
                 ORDER BY UpdateDate DESC;

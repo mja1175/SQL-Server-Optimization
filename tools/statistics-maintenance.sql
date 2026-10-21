@@ -9,11 +9,11 @@ USE DBA_Utilities;
 GO
 
 -- ==========================================================================
--- Table: dbo.StatisticsUpdate
+-- Table: optimize.StatisticsMaintenanceHistory
 -- ==========================================================================
-IF OBJECT_ID('dbo.StatisticsUpdate', 'U') IS NULL
+IF OBJECT_ID('optimize.StatisticsMaintenanceHistory', 'U') IS NULL
 BEGIN
-    CREATE TABLE [dbo].[StatisticsUpdate](
+    CREATE TABLE optimize.StatisticsMaintenanceHistory(
         DatabaseName varchar(128) NOT NULL,
         SchemaName NVARCHAR(128) NOT NULL,
         TableName NVARCHAR(128) NOT NULL,
@@ -31,7 +31,7 @@ END
 GO
 
 -- ==========================================================================
--- Proc: dbo.sp_StatisticsMaintenance
+-- Proc: optimize.sp_StatisticsMaintenance
 -- ==========================================================================
 -- Stored Procedure: sp_StatisticsMaintenance V2 (ROBUST VERSION)
 -- Description: Check for stale statistics and optionally update them
@@ -54,22 +54,23 @@ GO
 --      - Empty tables (0 rows) are excluded
 --      - Only user tables are included (system tables excluded)
 --
--- Usage: EXEC DBA_Utilities.dbo.sp_StatisticsMaintenance @Databases = 'USER_DATABASES', @Run = 0, @StatisticsSample = NULL, @TableName = NULL, @DetailOutput = 0
+-- Usage: EXEC DBA_Utilities.optimize.sp_StatisticsMaintenance @Databases = 'USER_DATABASES', @Run = 0, @StatisticsSample = NULL, @TableName = NULL, @DetailOutput = 0
 
-CREATE OR ALTER PROCEDURE dbo.sp_StatisticsMaintenance
+CREATE OR ALTER PROCEDURE optimize.sp_StatisticsMaintenance
     @Databases NVARCHAR(MAX) = NULL,      -- NULL = USER_DATABASES. Supports Ola Hallengren-style syntax
     @Run BIT = 0,                         -- 0 = display only (default), 1 = execute updates
     @StatisticsSample DECIMAL(5,2) = NULL,-- NULL = no WITH clause (default), 100 = WITH FULLSCAN, 1-99.99 = WITH SAMPLE X PERCENT
     @TableName NVARCHAR(MAX) = NULL,      -- NULL = all tables (default), or comma-separated list e.g. 'Orders' or 'dbo.Orders,sales.Invoices'
-    @DetailOutput BIT = 0                 -- 0 = minimal output (default - database progress only), 1 = detailed results
+    @DetailOutput BIT = 0,                -- 0 = minimal output (default - database progress only), 1 = detailed results
+    @PurgeAfterDays INT = 90             -- purge history records older than this many days
 AS
 BEGIN
     SET NOCOUNT ON;
 
     -- Ensure logging table exists
-    IF OBJECT_ID('DBA_Utilities.dbo.StatisticsUpdate', 'U') IS NULL
+    IF OBJECT_ID('DBA_Utilities.optimize.StatisticsMaintenanceHistory', 'U') IS NULL
     BEGIN
-        CREATE TABLE DBA_Utilities.dbo.StatisticsUpdate (
+        CREATE TABLE DBA_Utilities.optimize.StatisticsMaintenanceHistory (
             DatabaseName VARCHAR(128) NOT NULL,
             SchemaName NVARCHAR(128) NOT NULL,
             TableName NVARCHAR(128) NOT NULL,
@@ -85,12 +86,12 @@ BEGIN
         );
     END
 
-    -- Purge records older than 30 days
-    DELETE FROM DBA_Utilities.dbo.StatisticsUpdate WHERE UpdateDate < DATEADD(DAY, -30, GETDATE());
+    -- Purge old history
+    DELETE FROM DBA_Utilities.optimize.StatisticsMaintenanceHistory WHERE UpdateDate < DATEADD(DAY, -@PurgeAfterDays, GETDATE());
 
     -- Get next run number
     DECLARE @RunNumber INT;
-    SELECT @RunNumber = ISNULL(MAX(Run), 0) + 1 FROM DBA_Utilities.dbo.StatisticsUpdate;
+    SELECT @RunNumber = ISNULL(MAX(Run), 0) + 1 FROM DBA_Utilities.optimize.StatisticsMaintenanceHistory;
 
     -- Parse @TableName into a filter table (NULL/empty = no filter, all tables scanned)
     CREATE TABLE #TableFilter (SchemaName NVARCHAR(128) NULL, TableName NVARCHAR(128) NOT NULL);
@@ -308,7 +309,7 @@ BEGIN
                             SET @DBSuccess = @DBSuccess + 1;
                             SET @TotalSuccess = @TotalSuccess + 1;
 
-                            INSERT INTO DBA_Utilities.dbo.StatisticsUpdate
+                            INSERT INTO DBA_Utilities.optimize.StatisticsMaintenanceHistory
                                 (DatabaseName, SchemaName, TableName, StatisticName, LastUpdated, DaysSinceUpdate, Modifications, [RowCount], Percentage, Outcome, Run)
                             VALUES
                                 (@DBName, @SchemaName, @StatTableName, @StatName, @LastUpdate,
@@ -321,7 +322,7 @@ BEGIN
                             SET @DBErrors = @DBErrors + 1;
                             SET @TotalErrors = @TotalErrors + 1;
 
-                            INSERT INTO DBA_Utilities.dbo.StatisticsUpdate
+                            INSERT INTO DBA_Utilities.optimize.StatisticsMaintenanceHistory
                                 (DatabaseName, SchemaName, TableName, StatisticName, LastUpdated, DaysSinceUpdate, Modifications, [RowCount], Percentage, Outcome, Run)
                             VALUES
                                 (@DBName, @SchemaName, @StatTableName, @StatName, @LastUpdate,

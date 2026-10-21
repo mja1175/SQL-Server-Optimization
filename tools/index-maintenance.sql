@@ -60,7 +60,8 @@ CREATE OR ALTER PROCEDURE optimize.sp_IndexMaintenance
     @TimeLimit          INT             = 18000,        -- seconds. 18000 = 5 hours. 0 = no limit
     @Execute            BIT             = 0,            -- 0 = dry run (show what would happen). 1 = execute maintenance
     @LOBCompaction      BIT             = 1,            -- LOB_COMPACTION = ON for REORGANIZE operations
-    @SortBy             VARCHAR(20)     = 'FRAGMENTATION' -- FRAGMENTATION (default) or SIZE
+    @SortBy             VARCHAR(20)     = 'FRAGMENTATION', -- FRAGMENTATION (default) or SIZE
+    @PurgeAfterDays     INT             = 90             -- purge history records older than this many days
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -85,7 +86,7 @@ BEGIN
     DECLARE @RunId INT;
     SELECT @RunId = ISNULL(MAX(RunId), 0) + 1 FROM optimize.IndexMaintenanceHistory;
 
-    DELETE FROM optimize.IndexMaintenanceHistory WHERE CreatedDate < DATEADD(DAY, -90, SYSDATETIME());
+    DELETE FROM optimize.IndexMaintenanceHistory WHERE CreatedDate < DATEADD(DAY, -@PurgeAfterDays, SYSDATETIME());
 
     DECLARE @RunStartTime DATETIME2(3) = SYSDATETIME();
     DECLARE @TimeLimitEnd DATETIME2(3) = CASE

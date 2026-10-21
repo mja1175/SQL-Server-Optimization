@@ -104,7 +104,7 @@ EXEC optimize.sp_IndexMaintenance @Execute = 0;  -- Preview
 EXEC optimize.sp_IndexMaintenance @Execute = 1;  -- Execute
 
 -- Statistics maintenance
-EXEC dbo.sp_StatisticsMaintenance @Run = 1, @StatisticsSample = 100;
+EXEC optimize.sp_StatisticsMaintenance @Run = 1, @StatisticsSample = 100;
 ```
 
 ## Key Features

@@ -12,7 +12,13 @@ CREATE OR ALTER PROCEDURE optimize.sp_AnalyzeQueryPlan
     @SQL          NVARCHAR(MAX)  = NULL,  -- query to analyze (executes it, grabs plan from cache)
     @PlanXML      XML            = NULL,  -- OR pass in a plan directly (from .sqlplan file or SSMS)
     @DatabaseName NVARCHAR(128)  = NULL,  -- database context for @SQL (NULL = current)
-    @Debug        BIT = 0
+    @Debug        BIT = 0,
+    -- Stale statistics thresholds (tiered: low sample + some mods, med sample + more mods, or high mods alone)
+    @StatsLowModCount   INT           = 5000,    -- flag if mods > this AND sample < @StatsLowSamplePct
+    @StatsLowSamplePct  DECIMAL(5,2)  = 10.0,
+    @StatsMedModCount   INT           = 10000,   -- flag if mods > this AND sample < @StatsMedSamplePct
+    @StatsMedSamplePct  DECIMAL(5,2)  = 50.0,
+    @StatsHighModCount  INT           = 100000   -- flag if mods > this (regardless of sample)
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -123,9 +129,9 @@ BEGIN
             + QUOTENAME(REPLACE(REPLACE(s.value('@Statistics', 'NVARCHAR(128)'), '[', ''), ']', ''))
             + ' WITH FULLSCAN;' AS Recommendation
     FROM @PlanXML.nodes('//OptimizerStatsUsage/StatisticsInfo') AS si(s)
-    WHERE (s.value('@ModificationCount', 'BIGINT') > 5000 AND s.value('@SamplingPercent', 'DECIMAL(10,2)') < 5.0)
-       OR (s.value('@ModificationCount', 'BIGINT') > 25000 AND s.value('@SamplingPercent', 'DECIMAL(10,2)') < 25.0)
-       OR s.value('@ModificationCount', 'BIGINT') > 250000
+    WHERE (s.value('@ModificationCount', 'BIGINT') > @StatsLowModCount AND s.value('@SamplingPercent', 'DECIMAL(10,2)') < @StatsLowSamplePct)
+       OR (s.value('@ModificationCount', 'BIGINT') > @StatsMedModCount AND s.value('@SamplingPercent', 'DECIMAL(10,2)') < @StatsMedSamplePct)
+       OR s.value('@ModificationCount', 'BIGINT') > @StatsHighModCount
 
     UNION ALL
 
@@ -184,15 +190,34 @@ BEGIN
               / CAST(ISNULL(ro.value('(RunTimeInformation/RunTimeCountersPerThread/@ActualRows)[1]', 'BIGINT'), 1) AS FLOAT) > 100
       )
 
+    UNION ALL
+
+    -- =========================================================================
+    -- 6. MANY-TO-MANY MERGE JOINS (can explode row counts)
+    -- =========================================================================
+    SELECT
+        'MANY_TO_MANY_MERGE' AS FindingType,
+        'Many-to-Many Merge Join' AS Finding,
+        'Est. Rows: ' + CAST(ro.value('@EstimateRows', 'FLOAT') AS VARCHAR(30))
+            + ' | Actual Rows: ' + CAST(ISNULL(ro.value('(RunTimeInformation/RunTimeCountersPerThread/@ActualRows)[1]', 'BIGINT'), 0) AS VARCHAR(30))
+            + ' | Rows Read: ' + CAST(ISNULL(ro.value('(RunTimeInformation/RunTimeCountersPerThread/@ActualRowsRead)[1]', 'BIGINT'), 0) AS VARCHAR(30)) AS Detail,
+        'Many-to-many merge joins can read exponentially more rows than output. Check statistics or consider hash join hint.' AS Recommendation
+    FROM @PlanXML.nodes('//RelOp[@PhysicalOp="Merge Join"]') AS r(ro)
+    CROSS APPLY ro.nodes('Merge') AS m(mj)
+    WHERE mj.value('@ManyToMany', 'BIT') = 1
+      AND ISNULL(ro.value('(RunTimeInformation/RunTimeCountersPerThread/@ActualRowsRead)[1]', 'BIGINT'), 0)
+          > ISNULL(ro.value('(RunTimeInformation/RunTimeCountersPerThread/@ActualRows)[1]', 'BIGINT'), 1) * 100
+
     ) AS results
     ORDER BY
         CASE FindingType
-            WHEN 'STALE_STATISTICS' THEN 1
-            WHEN 'MISSING_INDEX' THEN 2
-            WHEN 'KEY_LOOKUP' THEN 3
-            WHEN 'CARDINALITY_ISSUE' THEN 4
-            WHEN 'IMPLICIT_CONVERSION' THEN 5
-            ELSE 6
+            WHEN 'MANY_TO_MANY_MERGE' THEN 1
+            WHEN 'STALE_STATISTICS' THEN 2
+            WHEN 'MISSING_INDEX' THEN 3
+            WHEN 'KEY_LOOKUP' THEN 4
+            WHEN 'CARDINALITY_ISSUE' THEN 5
+            WHEN 'IMPLICIT_CONVERSION' THEN 6
+            ELSE 7
         END;
 END
 GO

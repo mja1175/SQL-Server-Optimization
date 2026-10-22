@@ -2,7 +2,7 @@
 
 A comprehensive SQL Server index optimization and maintenance toolkit. Eight tools that find what's missing, remove what's redundant, diagnose what's slow, and keep your indexes and statistics healthy — plus an orchestrator that runs them all with one call.
 
-All objects install into the `indexing` schema in a `DBA_Utilities` database. One script, one schema, every server.
+One script, one schema, every server.
 
 ## What's Included
 

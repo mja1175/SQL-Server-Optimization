@@ -10990,23 +10990,23 @@ BEGIN
 
     ---------------------------------------------------------------------------
     -- 6. Missing Index Recommendations (optimize-index)
+    --    Reads from MissingIndexResults (persistent) instead of GeneratedScripts
+    --    (working table that gets wiped on reinstall).
     ---------------------------------------------------------------------------
-    IF OBJECT_ID('optimize.GeneratedScripts', 'U') IS NOT NULL
+    IF OBJECT_ID('optimize.MissingIndexResults', 'U') IS NOT NULL
     BEGIN
-        INSERT INTO #Summary (SortOrder, Tool, Resolved, Pending, Databases, Detail)
+        INSERT INTO #Summary (SortOrder, Tool, Resolved, Pending, Databases, Tables, Indexes, Detail)
         SELECT
             6,
             'Missing Index (optimize-index)',
-            SUM(CASE WHEN Status LIKE 'Has Recommendations%' THEN 1 ELSE 0 END),
-            SUM(CASE WHEN Status = 'Nothing To Run Under Parameter' THEN 1 ELSE 0 END),
+            SUM(CASE WHEN ResolvedDate IS NOT NULL AND ResolvedDate >= @Since THEN 1 ELSE 0 END),
+            SUM(CASE WHEN ResolvedDate IS NULL THEN 1 ELSE 0 END),
             COUNT(DISTINCT DatabaseName),
-            CAST(SUM(CASE WHEN Status LIKE 'Has Recommendations%' THEN 1 ELSE 0 END) AS VARCHAR(10)) + ' DBs with recommendations, '
-            + CAST(SUM(CASE WHEN Status = 'Nothing To Run Under Parameter' THEN 1 ELSE 0 END) AS VARCHAR(10)) + ' exceed size threshold, '
-            + CAST(SUM(CASE WHEN Status = 'No Recommendations' THEN 1 ELSE 0 END) AS VARCHAR(10)) + ' clean'
-            + CASE WHEN SUM(CASE WHEN Status LIKE '%Enterprise Bypass%' THEN 1 ELSE 0 END) > 0
-                   THEN ', ' + CAST(SUM(CASE WHEN Status LIKE '%Enterprise Bypass%' THEN 1 ELSE 0 END) AS VARCHAR(10)) + ' enterprise bypass'
-                   ELSE '' END
-        FROM optimize.GeneratedScripts
+            COUNT(DISTINCT SchemaName + '.' + TableName),
+            COUNT(*),
+            CAST(SUM(CASE WHEN ResolvedDate IS NOT NULL AND ResolvedDate >= @Since THEN 1 ELSE 0 END) AS VARCHAR(10)) + ' resolved, '
+            + CAST(SUM(CASE WHEN ResolvedDate IS NULL THEN 1 ELSE 0 END) AS VARCHAR(10)) + ' pending'
+        FROM optimize.MissingIndexResults
         WHERE DatabaseName IN (SELECT DatabaseName FROM optimize.fn_GetDatabases(@Databases));
     END
 
